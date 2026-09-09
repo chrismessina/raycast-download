@@ -1,0 +1,332 @@
+/**
+ * curl transport: config construction, progress parsing, exit classification.
+ *
+ * Why curl rather than Node's own `fetch`: the transfer has to outlive the
+ * Raycast command that started it. A detached Node process could do it, but
+ * curl already handles Range resume, redirects, retries and connection timeouts,
+ * and it is present on every macOS install.
+ *
+ * Two decisions here are load-bearing, both verified empirically:
+ *
+ *  1. The URL is passed in a 0600 CONFIG FILE, never on the command line.
+ *     Signed URLs are bearer credentials; argv is world-readable via `ps`.
+ *     Measured: with the URL as an argument it is visible in `ps`; via `-K` it
+ *     is not.
+ *  2. Timeouts are THROUGHPUT-based (`--speed-limit`/`--speed-time`), not
+ *     wall-clock (`--max-time`). `--max-time` counts machine sleep against the
+ *     budget, so a laptop closed for ten minutes guarantees a spurious failure
+ *     on an otherwise healthy transfer.
+ */
+
+import { DownloadError, type DownloadErrorCode, type SignalName, classifyHttpStatus } from "./errors";
+
+/**
+ * Is `curl` available on this system?
+ *
+ * Called before spawning so a missing binary is reported as a prerequisite the
+ * user can act on, rather than as a generic transport failure surfacing minutes
+ * after `startDownload` already reported success.
+ *
+ * Present by default on macOS and on Windows 10+ (`System32\curl.exe`), so this
+ * is a guard against unusual environments rather than a common path. Cached —
+ * the answer cannot change within a process's lifetime in any way that matters.
+ */
+let curlAvailable: boolean | undefined;
+
+export function hasCurl(): boolean {
+  if (curlAvailable !== undefined) return curlAvailable;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
+    execFileSync("curl", ["--version"], { stdio: "ignore", timeout: 5000 });
+    curlAvailable = true;
+  } catch {
+    curlAvailable = false;
+  }
+  return curlAvailable;
+}
+
+/** Bytes/sec below which a transfer is considered dead, sustained for `stallSeconds`. */
+export const DEFAULT_SPEED_LIMIT_BYTES = 1024;
+export const DEFAULT_STALL_SECONDS = 120;
+
+export interface CurlConfigOptions {
+  url: string;
+  /** Destination. Callers should pass the `.part` path, not the final one. */
+  outputPath: string;
+  headers?: Record<string, string>;
+  followRedirects?: boolean;
+  /** Continue a partial transfer via HTTP Range. */
+  resume?: boolean;
+  /**
+   * Stall THRESHOLD, not a rate limit: if throughput stays below this for
+   * `stallSeconds`, curl aborts. Lowering it makes stall detection more
+   * forgiving; it does not slow the transfer down.
+   */
+  speedLimitBytes?: number;
+  stallSeconds?: number;
+  connectTimeoutSeconds?: number;
+  /**
+   * Cap the transfer rate in bytes/sec (curl `--limit-rate`). Genuinely slows
+   * the download — useful for tests and for not saturating a connection.
+   */
+  limitRateBytes?: number;
+  /**
+   * Absolute wall-clock cap. Deliberately optional and unset by default —
+   * see the note above about sleep.
+   */
+  maxTimeSeconds?: number;
+}
+
+/**
+ * Build the contents of a curl config file (`curl -K <file>`).
+ *
+ * Everything sensitive lives in this file, which the caller must create 0600 and
+ * delete once curl has started.
+ */
+export function buildCurlConfig(options: CurlConfigOptions): string {
+  const {
+    url,
+    outputPath,
+    headers = {},
+    followRedirects = true,
+    resume = false,
+    speedLimitBytes = DEFAULT_SPEED_LIMIT_BYTES,
+    stallSeconds = DEFAULT_STALL_SECONDS,
+    connectTimeoutSeconds = 30,
+    limitRateBytes,
+    maxTimeSeconds,
+  } = options;
+
+  const lines: string[] = [
+    `url = "${escapeConfigValue(url)}"`,
+    `output = "${escapeConfigValue(outputPath)}"`,
+    // `fail` (not `fail-with-body`): on a 4xx/5xx, curl must write NOTHING to
+    // the output file.
+    //
+    // With `fail-with-body`, an error response body lands in the `.part` file —
+    // measured: a 404 wrote 21 bytes of `{"error":"Not found"}`. Because the
+    // partial is deliberately retained for resume, the next attempt's
+    // `continue-at = -` would start AFTER those bytes, splicing an error
+    // document into the middle of the media. The file would then pass a
+    // size check and be published as complete. Silent corruption is far worse
+    // than losing an error body we never surface to the user anyway.
+    "fail",
+    `connect-timeout = ${connectTimeoutSeconds}`,
+    // Throughput-based stall detection: survives sleep, catches a dead socket.
+    `speed-limit = ${speedLimitBytes}`,
+    `speed-time = ${stallSeconds}`,
+    // Authoritative final numbers, parsed from stdout on exit.
+    'write-out = "\\n%{size_download}\\n%{speed_download}\\n%{http_code}\\n"',
+  ];
+
+  if (followRedirects) lines.push("location");
+  // `-C -` asks curl to work out the offset from the existing file.
+  if (resume) lines.push("continue-at = -");
+  if (limitRateBytes !== undefined) lines.push(`limit-rate = ${limitRateBytes}`);
+  if (maxTimeSeconds !== undefined) lines.push(`max-time = ${maxTimeSeconds}`);
+
+  for (const [name, value] of Object.entries(headers)) {
+    lines.push(`header = "${escapeConfigValue(`${name}: ${value}`)}"`);
+  }
+
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Escape a value for curl's config quoting.
+ *
+ * Escaping quotes and backslashes is not sufficient on its own: curl's config
+ * format is line-oriented, so a raw newline inside a value ends the line and
+ * whatever follows is parsed as a fresh directive. Measured behavior is that
+ * curl rejects the resulting malformed URL rather than honoring the smuggled
+ * directive — but that is curl's parser saving us, not our own correctness.
+ *
+ * So control characters are rejected outright rather than escaped. A URL or
+ * header value containing a newline is malformed anyway; refusing it makes
+ * config injection structurally impossible instead of contingent on curl.
+ */
+function escapeConfigValue(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(value)) {
+    throw new DownloadError("validation", "Refusing a value containing control characters.");
+  }
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+export interface CurlProgress {
+  bytesDownloaded: number;
+  totalBytes?: number;
+  speedBytesPerSec?: number;
+  etaSeconds?: number;
+}
+
+/**
+ * Parse curl's default progress meter.
+ *
+ * Deliberately NOT `--progress-bar`: that mode emits only a percentage, which is
+ * why the existing Fetch extension's speed and ETA fields are hardcoded to zero
+ * and its speed UI has never rendered. The default meter carries real numbers:
+ *
+ *   % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+ *                                  Dload  Upload   Total   Spent    Left  Speed
+ *  13  365M   13 48.7M    0     0  8058k      0  0:00:46  0:00:06  0:00:40 8501k
+ *
+ * Returns the most recent complete sample, or null if none is present yet.
+ */
+export function parseCurlMeter(buffer: string): CurlProgress | null {
+  // Meter updates are separated by \r; take complete lines only.
+  const lines = buffer.split(/[\r\n]+/).filter((line) => line.trim().length > 0);
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const fields = lines[i].trim().split(/\s+/);
+    // 12 columns; the first is a percentage, so require a leading integer.
+    if (fields.length < 12) continue;
+    if (!/^\d+$/.test(fields[0])) continue;
+
+    const totalBytes = parseCurlSize(fields[1]);
+    const bytesDownloaded = parseCurlSize(fields[3]);
+    if (bytesDownloaded === undefined) continue;
+
+    const speedBytesPerSec = parseCurlSize(fields[6]);
+    const etaSeconds = parseCurlDuration(fields[10]);
+
+    return {
+      bytesDownloaded,
+      totalBytes: totalBytes && totalBytes > 0 ? totalBytes : undefined,
+      speedBytesPerSec,
+      etaSeconds,
+    };
+  }
+
+  return null;
+}
+
+/** Parse curl's abbreviated sizes: `1234`, `48.7M`, `365M`, `8058k`. */
+export function parseCurlSize(field: string | undefined): number | undefined {
+  if (!field) return undefined;
+  const match = /^(\d+(?:\.\d+)?)([kKmMgGtT])?$/.exec(field.trim());
+  if (!match) return undefined;
+
+  const value = parseFloat(match[1]);
+  if (!Number.isFinite(value)) return undefined;
+
+  const multipliers: Record<string, number> = { k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 };
+  const suffix = match[2]?.toLowerCase();
+  return suffix ? Math.round(value * multipliers[suffix]) : value;
+}
+
+/** Parse `H:MM:SS`. curl prints `--:--:--` when it has no estimate. */
+export function parseCurlDuration(field: string | undefined): number | undefined {
+  if (!field || field.includes("-")) return undefined;
+  const parts = field.trim().split(":");
+  if (parts.length !== 3) return undefined;
+
+  const [h, m, s] = parts.map((p) => parseInt(p, 10));
+  if ([h, m, s].some((n) => Number.isNaN(n))) return undefined;
+  return h * 3600 + m * 60 + s;
+}
+
+export interface CurlWriteOut {
+  sizeDownload?: number;
+  speedDownload?: number;
+  httpCode?: number;
+}
+
+/** Parse the trailing `write-out` block (size, speed, http_code — one per line). */
+export function parseWriteOut(stdout: string): CurlWriteOut {
+  const lines = stdout.trim().split("\n").filter(Boolean);
+  if (lines.length < 3) return {};
+
+  const [size, speed, code] = lines.slice(-3).map((line) => Number(line.trim()));
+  return {
+    sizeDownload: Number.isFinite(size) ? size : undefined,
+    speedDownload: Number.isFinite(speed) ? speed : undefined,
+    httpCode: Number.isFinite(code) ? code : undefined,
+  };
+}
+
+/**
+ * curl exit codes worth distinguishing.
+ * https://curl.se/libcurl/c/libcurl-errors.html
+ */
+const EXIT_CODES: Record<number, { code: DownloadErrorCode; message: string }> = {
+  6: { code: "dns", message: "Could not resolve host." },
+  7: { code: "network", message: "Failed to connect to the server." },
+  18: { code: "network", message: "Transfer ended early." },
+  22: { code: "http_client", message: "The server returned an error." },
+  23: { code: "disk_full", message: "Could not write the file — the disk may be full." },
+  26: { code: "permission", message: "Could not read from the local file." },
+  28: { code: "timeout", message: "The transfer timed out." },
+  33: { code: "network", message: "The server does not support resuming; restart the download." },
+  35: { code: "tls", message: "Could not establish a secure connection." },
+  36: { code: "integrity", message: "Could not resume — the partial file is unusable." },
+  47: { code: "network", message: "Too many redirects." },
+  52: { code: "network", message: "The server returned nothing." },
+  55: { code: "network", message: "Failed to send data to the server." },
+  56: { code: "network", message: "Connection lost during transfer." },
+  63: { code: "http_client", message: "The response exceeded the maximum allowed size." },
+};
+
+export interface ClassifyCurlInput {
+  exitCode: number | null;
+  signal?: SignalName | null;
+  httpCode?: number;
+  stderrTail?: string;
+  /** True when the local process deliberately terminated curl. */
+  cancelled?: boolean;
+}
+
+/**
+ * Turn a finished curl invocation into a typed error.
+ *
+ * HTTP status is consulted before the exit code: curl exits 22 for every 4xx/5xx
+ * under `fail-with-body`, and "403 Forbidden" is far more actionable than
+ * "curl exited 22".
+ */
+export function classifyCurlFailure(input: ClassifyCurlInput): DownloadError {
+  const { exitCode, signal, httpCode, stderrTail, cancelled } = input;
+
+  if (cancelled || signal === "SIGTERM" || signal === "SIGINT") {
+    return new DownloadError("cancelled", "Download cancelled.", { exitCode, signal });
+  }
+
+  if (httpCode !== undefined && httpCode >= 400) {
+    const code = classifyHttpStatus(httpCode);
+    return new DownloadError(code, httpErrorMessage(httpCode), { httpStatus: httpCode, exitCode, signal });
+  }
+
+  if (exitCode !== null && EXIT_CODES[exitCode]) {
+    const { code, message } = EXIT_CODES[exitCode];
+    return new DownloadError(code, message, { exitCode, signal, httpStatus: httpCode });
+  }
+
+  // Last resort: curl's own words are more useful than a bare number.
+  const detail = stderrTail?.trim().split("\n").pop()?.trim();
+  return new DownloadError(
+    "unknown",
+    detail ? `Download failed: ${detail}` : `Download failed (curl exit ${exitCode ?? "unknown"}).`,
+    { exitCode, signal, httpStatus: httpCode },
+  );
+}
+
+function httpErrorMessage(status: number): string {
+  switch (status) {
+    case 401:
+      return "Not authorized — the credentials were rejected.";
+    case 403:
+      return "Access denied. The link may have expired, or you may not have permission to download this.";
+    case 404:
+      return "The file was not found on the server.";
+    case 410:
+      return "The download link has expired.";
+    case 416:
+      return "Could not resume from the existing partial file.";
+    case 429:
+      return "Rate limited by the server. Try again shortly.";
+    default:
+      return status >= 500
+        ? `The server is temporarily unavailable (HTTP ${status}).`
+        : `The server rejected the request (HTTP ${status}).`;
+  }
+}

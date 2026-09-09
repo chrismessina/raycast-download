@@ -1,0 +1,116 @@
+{
+  "name": "@chrismessina/raycast-download",
+  "version": "0.1.0",
+  "description": "Downloads for Raycast extensions that survive the window closing: detached transfers, resumable via HTTP Range, with safe paths, progress and history",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./paths": {
+      "types": "./dist/paths.d.ts",
+      "default": "./dist/paths.js"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "default": "./dist/errors.js"
+    },
+    "./progress": {
+      "types": "./dist/progress.d.ts",
+      "default": "./dist/progress.js"
+    },
+    "./history": {
+      "types": "./dist/history.d.ts",
+      "default": "./dist/history.js"
+    },
+    "./status": {
+      "types": "./dist/status.d.ts",
+      "default": "./dist/status.js"
+    },
+    "./detach": {
+      "types": "./dist/detach.d.ts",
+      "default": "./dist/detach.js"
+    },
+    "./curl": {
+      "types": "./dist/curl.d.ts",
+      "default": "./dist/curl.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "paths": [
+        "dist/paths.d.ts"
+      ],
+      "errors": [
+        "dist/errors.d.ts"
+      ],
+      "progress": [
+        "dist/progress.d.ts"
+      ],
+      "history": [
+        "dist/history.d.ts"
+      ],
+      "status": [
+        "dist/status.d.ts"
+      ],
+      "detach": [
+        "dist/detach.d.ts"
+      ],
+      "curl": [
+        "dist/curl.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "dist",
+    "scripts"
+  ],
+  "scripts": {
+    "build": "tsc && npm run bundle-runner",
+    "watch": "tsc --watch",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm test",
+    "clean": "rm -rf dist",
+    "test:unit": "npm run build && SKIP_INTEGRATION=1 node --test test/*.test.mjs",
+    "bundle-runner": "node scripts/bundle-runner.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "raycast",
+    "raycast-extension",
+    "download",
+    "detached",
+    "resume",
+    "house-style"
+  ],
+  "author": "Chris Messina",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "win32"
+  ],
+  "peerDependencies": {
+    "@raycast/api": "^1.0.0"
+  },
+  "devDependencies": {
+    "@raycast/api": "^1.83.2",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chrismessina/raycast-download.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chrismessina/raycast-download/issues"
+  },
+  "homepage": "https://github.com/chrismessina/raycast-download#readme"
+}
