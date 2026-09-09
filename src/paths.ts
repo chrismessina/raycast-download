@@ -98,13 +98,25 @@ export interface ResolveDirectoryOptions {
   fallback?: string;
   /** mkdir -p the result. Default true. */
   create?: boolean;
+  /**
+   * Called when the resolved directory is NOT the one asked for, so the caller can
+   * say so. Without this the fallback is silent: a user whose configured directory
+   * is rejected gets their files in ~/Downloads with no explanation, and reads it as
+   * the preference being ignored.
+   *
+   * Fires only when an input was supplied and something else was chosen — never for
+   * an absent input (nothing was attempted) and never when `onUnsafe: "throw"` (the
+   * throw is already the signal). Throwing from this callback is the caller's own
+   * bug, so it is invoked after the path is settled but before `mkdir`.
+   */
+  onFallback?: (attempted: string, chosen: string) => void;
 }
 
 /**
  * Resolve a user-supplied directory preference to a safe absolute path.
  */
 export function resolveDirectory(input: string | undefined, options: ResolveDirectoryOptions = {}): string {
-  const { allowedRoots = [homedir(), tmpdir()], onUnsafe = "fallback", create = true } = options;
+  const { allowedRoots = [homedir(), tmpdir()], onUnsafe = "fallback", create = true, onFallback } = options;
   const fallback = options.fallback ?? join(homedir(), "Downloads");
 
   const candidate = input?.trim() ? resolve(expandHome(input.trim())) : undefined;
@@ -121,6 +133,8 @@ export function resolveDirectory(input: string | undefined, options: ResolveDire
   } else {
     chosen = fallback;
   }
+
+  if (candidate && chosen !== candidate) onFallback?.(candidate, chosen);
 
   if (create) mkdirSync(chosen, { recursive: true });
   return chosen;

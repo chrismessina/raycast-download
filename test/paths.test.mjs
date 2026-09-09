@@ -325,3 +325,41 @@ test("writeSecretFile creates a new file already restricted", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("resolveDirectory reports a fallback so the caller can explain it", (t) => {
+  const outside = "/etc/definitely-not-under-home";
+  const calls = [];
+  const chosen = resolveDirectory(outside, {
+    onUnsafe: "fallback",
+    fallback: tmpdir(),
+    create: false,
+    onFallback: (attempted, picked) => calls.push([attempted, picked]),
+  });
+  assert.equal(chosen, tmpdir());
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], outside);
+  assert.equal(calls[0][1], tmpdir());
+});
+
+test("resolveDirectory does NOT report a fallback when the input was accepted", () => {
+  const calls = [];
+  const inside = join(tmpdir(), "accepted-dir");
+  const chosen = resolveDirectory(inside, { create: false, onFallback: () => calls.push(1) });
+  assert.equal(chosen, inside);
+  assert.equal(calls.length, 0, "nothing was overridden, so nothing to report");
+});
+
+test("resolveDirectory does NOT report a fallback when no input was supplied", () => {
+  const calls = [];
+  resolveDirectory(undefined, { fallback: tmpdir(), create: false, onFallback: () => calls.push(1) });
+  assert.equal(calls.length, 0, "no directory was attempted, so there is no override to explain");
+});
+
+test("resolveDirectory throws instead of reporting when onUnsafe is throw", () => {
+  const calls = [];
+  assert.throws(
+    () => resolveDirectory("/etc/nope", { onUnsafe: "throw", create: false, onFallback: () => calls.push(1) }),
+    /outside the allowed roots/,
+  );
+  assert.equal(calls.length, 0, "the throw is already the signal");
+});

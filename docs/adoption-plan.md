@@ -194,9 +194,12 @@ written twice with different meanings across the resume path (`runner.ts:168` = 
 Range-remaining; `runner.ts:272` = expected/final), and `reconcile`'s equality check assumes one.
 INFERRED, not reproduced. Needs a test killing a resumed transfer during `finalizing`.
 
-**#4 `resolveDirectory`'s fallback is silent** (`paths.ts:111-113`). A user whose configured
-directory is rejected gets files in `~/Downloads` with no explanation. Add
-`onFallback?: (attempted, chosen) => void`.
+**#4 `resolveDirectory`'s fallback is silent — FIXED 2026-09-08.** A user whose configured
+directory was rejected got files in `~/Downloads` with no explanation, and read it as the
+preference being ignored. `onFallback?: (attempted, chosen) => void` now fires when the
+resolved directory is not the one asked for. Deliberately silent in two cases: no input was
+supplied (nothing was attempted, so there is no override to explain) and `onUnsafe: "throw"`
+(the throw is already the signal). Four tests cover all four branches.
 
 **#5 Overwrite mode forfeits reservation.** Fetch's `overwriteExisting` needs a plain `join()`,
 bypassing the atomic claim. Either an `overwrite: true` option on `uniquePath` that still
@@ -213,3 +216,37 @@ from URLs — `fetch(url)` → `arrayBuffer()` → `writeFile`. So ios-apps isn'
 true of the *IPA* path only. Still don't move them to Layer A: small images, capped at 50 MB,
 buffered in memory — a detached curl per screenshot is heavier than the problem. But they are a
 legitimate `classifyHttpStatus` consumer.
+
+---
+
+## Design intent — decided 2026-09-08
+
+**The goal is a browser-grade download baseline for Raycast extensions.** Not de-duplication:
+the point is that an extension that downloads something should behave the way a browser does —
+survives dismissal, resumable, honest progress, a history you can act on, a path you can reveal.
+That is the bar to design against when a question comes up, and it is why Layer A exists even
+though no extension has it today.
+
+**Addressable scope is the four self-authored extensions** (`fetch`, `threads`, `ios-apps`,
+`brew`). Third-party monorepo downloaders — Video Downloader (`vimtor`), Instagram Media
+Downloader, X/Twitter Video Downloader — are explicitly **out**: a standalone PR adding a
+personal dependency to an extension Chris does not own is against house rules, and a
+122k-install extension will not take one.
+
+**`formatBytes` stays duplicated, on purpose.** It moves to `@chrismessina/raycast-kit` for
+general extension use, and `progress.ts` keeps its own copy. The package advertises zero
+runtime dependencies because `runner.bundle.js` must bundle standalone for the detached
+process; coupling the runner to the kit for fifteen lines of arithmetic is the worse trade.
+
+**History URL canonicalization is a per-consumer toggle, not a global normalizer.** Canonical
+URLs are wanted for dedupe and counts, but the module already refuses to persist signed URLs,
+which are bearer credentials. Stripping query params is simultaneously what would make a signed
+URL safe to store and what would collide two genuinely different downloads. So it is opt-in per
+consumer, with the security posture named at the call site rather than assumed by the library.
+
+**A "Download Manager" shim extension is rejected.** Extension A deeplinking into a Download
+Manager command does not help: that command is also unloaded on dismissal, so it still needs
+the detached process or a native app underneath — at which point the shim is a cross-extension
+protocol and a second required install buying nothing `detach.ts` already provides directly.
+The native-app version of that idea is Coaster, tracked separately. (Also: "Downloads Manager"
+already exists in the Store at 76.9k installs, as a search-and-organize extension.)
