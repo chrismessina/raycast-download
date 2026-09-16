@@ -35,6 +35,7 @@ import {
   processStartTimeMs,
   readStatus,
   statusDir as defaultStatusDir,
+  withStatusLock,
   writeStatus,
   type DownloadStatus,
 } from "./status";
@@ -211,7 +212,7 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
       `Download runner not found. Looked in:\n${runnerSearchPaths()
         .map((p) => `  - ${p}`)
         .join("\n")}\n` +
-        `If this extension is bundled, copy the package's dist/runner.js next to the bundle, ` +
+        `If this extension is bundled, copy the package's dist/runner.bundle.js next to the bundle, ` +
         `or set RAYCAST_DOWNLOAD_RUNNER to its path.`,
     );
   }
@@ -273,9 +274,18 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
     throw new DownloadError("unknown", "Could not start the download process.");
   }
 
-  // Wait briefly for the runner's first status write, so callers can watch a
+  // Wait briefly for THIS attempt's first status write, so callers can watch a
   // file that already exists rather than racing it.
-  const seeded = await waitForStatus(id, statusDir, 3000);
+  //
+  // Gated on the spawned pid, which is the whole point. Ids are reusable — that
+  // is how a retry works — so on a retry the previous attempt's terminal status
+  // is still sitting on disk when we get here. Accepting it meant
+  // `startDownload` resolved immediately, and a watcher attached the moment it
+  // resolved read the OLD failure and settled on it: the user pressed Retry and
+  // was told, instantly, that it had failed again. The runner writes its own
+  // pid into its first status, so requiring the pid to match is a precise test
+  // for "this attempt, not the last one".
+  const seeded = await waitForStatus(id, statusDir, 3000, pid);
   if (!seeded) {
     // The runner may still be starting; seed a status so the download is
     // visible and cancellable rather than invisible until its first write.
@@ -303,11 +313,22 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
   return { id, pid, statusPath: join(statusDir, `${id}.json`) };
 }
 
-async function waitForStatus(id: string, dir: string, timeoutMs: number): Promise<DownloadStatus | null> {
+/**
+ * Wait for a status file written by a specific process.
+ *
+ * `pid` is required rather than optional: every caller is waiting on an attempt
+ * it just spawned, and the id alone cannot tell one attempt from another.
+ */
+async function waitForStatus(
+  id: string,
+  dir: string,
+  timeoutMs: number,
+  pid: number,
+): Promise<DownloadStatus | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const status = readStatus(id, dir);
-    if (status) return status;
+    if (status && status.pid === pid) return status;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return null;
@@ -336,11 +357,14 @@ export async function killDownload(
 
   const status = readStatus(ticket.id, statusDir);
   if (!status) return false;
+  // An id is reusable for Retry. A ticket names one spawned process, not every
+  // future status that happens to share its id.
+  if (ticket.pid !== undefined && ticket.pid !== status.pid) return false;
 
   // Identity check, not merely liveness.
   if (!isAlive(status)) {
     // Already gone: record the outcome so the UI stops showing it as running.
-    if (status.state !== "completed") {
+    if (!isTerminal(status.state)) {
       writeStatus({ ...status, state: "cancelled", finishedAt: Date.now() }, statusDir);
     }
     return false;
@@ -372,10 +396,20 @@ export async function killDownload(
 
   if (!terminateTree(status.pid, "SIGTERM")) return false;
 
-  // Escalate only if it ignored the polite signal.
+  // Escalate only if it ignored the polite signal — and only if the process
+  // still on record is the one we signalled.
+  //
+  // The grace period is long enough for a user to press Retry, which writes a
+  // NEW attempt's status under the same id. Re-reading the file and killing
+  // whatever pid it now names meant Cancel reached in and SIGKILLed the
+  // replacement download the user had just started. So escalation is pinned to
+  // the identity captured before the first signal, never to whatever the file
+  // says afterwards.
   await new Promise((resolve) => setTimeout(resolve, graceMs));
   const after = readStatus(ticket.id, statusDir);
-  if (after && isAlive(after)) {
+  const sameAttempt =
+    after !== null && after.pid === status.pid && after.startedAtMs === status.startedAtMs;
+  if (after && sameAttempt && isAlive(after)) {
     terminateTree(after.pid, "SIGKILL");
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
@@ -386,8 +420,18 @@ export async function killDownload(
   // `taskkill` terminates the tree without delivering a catchable signal, so
   // nothing in the runner ever runs — the status would sit at `downloading`
   // forever and a watcher would keep polling a download that no longer exists.
+  //
+  // Pinned to the original attempt for the same reason as the escalation above:
+  // stamping `cancelled` onto a replacement attempt's status would report a
+  // live download as cancelled.
   const settled = readStatus(ticket.id, statusDir);
-  if (settled && !isTerminal(settled.state) && !isAlive(settled)) {
+  if (
+    settled &&
+    settled.pid === status.pid &&
+    settled.startedAtMs === status.startedAtMs &&
+    !isTerminal(settled.state) &&
+    !isAlive(settled)
+  ) {
     writeStatus({ ...settled, state: "cancelled", finishedAt: Date.now() }, statusDir);
   }
 
@@ -437,27 +481,38 @@ function terminateTree(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean {
  * would be wrong.
  */
 export function reconcile(status: DownloadStatus, statusDir?: string): DownloadStatus {
-  if (status.state === "completed" || status.state === "failed" || status.state === "cancelled") return status;
-  if (isAlive(status)) return status;
+  return withStatusLock(status.id, statusDir, () => reconcileLocked(status, statusDir));
+}
 
-  const finalExists = existsSync(status.outputPath);
+function reconcileLocked(status: DownloadStatus, statusDir?: string): DownloadStatus {
+  // The caller's snapshot predates this lock. A Retry can replace it before
+  // reconciliation starts, in which case returning the current attempt is the
+  // only truthful outcome and it must not be overwritten.
+  const current = readStatus(status.id, statusDir);
+  if (current && (current.pid !== status.pid || current.startedAtMs !== status.startedAtMs)) return current;
+  const attempt = current ?? status;
+
+  if (isTerminal(attempt.state)) return attempt;
+  if (isAlive(attempt)) return attempt;
+
+  const finalExists = existsSync(attempt.outputPath);
   const sizeMatches =
     finalExists &&
-    (status.totalBytes === undefined || safeSize(status.outputPath) === status.totalBytes);
+    (attempt.totalBytes === undefined || safeSize(attempt.outputPath) === attempt.totalBytes);
 
   const reconciled: DownloadStatus =
-    status.state === "finalizing" && sizeMatches
+    attempt.state === "finalizing" && sizeMatches
       ? {
-          ...status,
+          ...attempt,
           state: "completed",
-          finishedAt: status.finishedAt ?? Date.now(),
-          bytesDownloaded: safeSize(status.outputPath),
+          finishedAt: attempt.finishedAt ?? Date.now(),
+          bytesDownloaded: safeSize(attempt.outputPath),
         }
       : {
-          ...status,
+          ...attempt,
           state: "failed",
-          finishedAt: status.finishedAt ?? Date.now(),
-          error: status.error ?? describeAbandonment(status),
+          finishedAt: attempt.finishedAt ?? Date.now(),
+          error: attempt.error ?? describeAbandonment(attempt),
         };
 
   try {

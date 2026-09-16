@@ -20,7 +20,7 @@ import { dirname } from "node:path";
 
 import { buildCurlConfig, classifyCurlFailure, parseCurlMeter, parseWriteOut } from "./curl";
 import { writeSecretFile } from "./paths";
-import { isTerminal, writeStatus, type DownloadStatus } from "./status";
+import { isTerminal, processStartTimeMs, writeStatus, type DownloadStatus } from "./status";
 
 interface RunnerPayload {
   id: string;
@@ -84,11 +84,20 @@ function main(): void {
   }
 
   const startedAt = Date.now();
+  // The OS process creation time, NOT the time JavaScript got here.
+  //
+  // `(pid, startedAtMs)` is the identity every liveness and kill check compares
+  // against, with a 2s tolerance for `ps` reporting whole seconds. A cold Node
+  // start under load takes longer than that, so recording the JS-init timestamp
+  // made a perfectly healthy runner fail its own identity check: `isAlive`
+  // returned false while bytes were still arriving, and the download was
+  // reconciled as abandoned mid-transfer. Read the value the checkers read.
+  const startedAtMs = processStartTimeMs(process.pid) ?? startedAt;
   let status: DownloadStatus = {
     schema: 1,
     id: payload.id,
     pid: process.pid,
-    startedAtMs: startedAt,
+    startedAtMs,
     state: "starting",
     filename: payload.filename,
     outputPath: payload.outputPath,
@@ -111,7 +120,25 @@ function main(): void {
 
   persist({});
 
-  mkdirSync(dirname(payload.partPath), { recursive: true });
+  const failSetup = (code: "validation" | "permission", error: unknown): void => {
+    // `uniquePath(..., { reserve: true })` creates this empty `.part` before
+    // launching us. No transfer has begun on setup failure, so retaining it
+    // cannot help resume and instead burns the original filename forever.
+    discardEmptyPart(payload.partPath);
+    persist({
+      state: "failed",
+      finishedAt: Date.now(),
+      error: { code, message: error instanceof Error ? error.message : String(error) },
+    });
+  };
+
+  try {
+    mkdirSync(dirname(payload.partPath), { recursive: true });
+  } catch (error) {
+    failSetup("permission", error);
+    process.exit(1);
+    return;
+  }
 
   // Resume only when there is something to resume from; `-C -` against a
   // zero-byte or absent file makes curl error rather than start cleanly.
@@ -133,11 +160,7 @@ function main(): void {
     writeSecretFile(configPath, config);
   } catch (error) {
     // buildCurlConfig rejects control characters in the URL or headers.
-    persist({
-      state: "failed",
-      finishedAt: Date.now(),
-      error: { code: "validation", message: error instanceof Error ? error.message : String(error) },
-    });
+    failSetup("validation", error);
     process.exit(1);
     return;
   }
@@ -230,6 +253,7 @@ function main(): void {
   child.on("error", (error) => {
     clearInterval(heartbeat);
     removeConfig();
+    discardEmptyPart(payload.partPath);
     persist({
       state: "failed",
       finishedAt: Date.now(),
@@ -316,7 +340,11 @@ function main(): void {
     // the rename and the completion write is recoverable: a reader seeing a dead
     // runner in `finalizing` with a correctly-sized final file reconciles it to
     // completed rather than reporting a spurious failure.
-    persist({ state: "finalizing", bytesDownloaded: finalBytes, totalBytes: expected ?? finalBytes });
+    // `totalBytes` is the value reconciliation compares against after a crash.
+    // Advisory mode deliberately publishes a clean curl result even when a
+    // caller's estimate differs, so record the bytes we are actually about to
+    // publish rather than an expectation that advisory mode declined to enforce.
+    persist({ state: "finalizing", bytesDownloaded: finalBytes, totalBytes: finalBytes });
 
     try {
       renameSync(payload.partPath, payload.outputPath);

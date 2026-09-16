@@ -28,6 +28,13 @@
  * Range rather than starting over.
  *
  * Zero runtime dependencies. `@raycast/api` is a peer.
+ *
+ * SECRETS ARE THE CALLER'S RESPONSIBILITY. Nothing here inspects a URL before
+ * persisting it: `meta` is written to the status file verbatim and
+ * `DownloadRecord.url` is written to history verbatim. Signed URLs are bearer
+ * credentials, so store a re-resolvable identifier instead — or set
+ * `createDownloadHistory({ urlPolicy: "omit-signed" })` to have the library
+ * enforce it for history (opt-in; the default persists what you pass).
  */
 
 export {
@@ -61,6 +68,8 @@ export {
 export {
   createDownloadHistory,
   reconcileHistory,
+  looksLikeSignedUrl,
+  type HistoryUrlPolicy,
   type DownloadHistory,
   type DownloadRecord,
   type HistoryOptions,
@@ -84,6 +93,8 @@ export {
   canVerifyProcessIdentity,
   acquireLease,
   releaseLease,
+  statusLockPath,
+  withStatusLock,
   type DownloadStatus,
   type DownloadState,
   type StatusWatcher,

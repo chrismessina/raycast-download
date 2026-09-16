@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
-import { createDownloadHistory } from "../dist/history.js";
+import { createDownloadHistory, looksLikeSignedUrl, reconcileHistory } from "../dist/history.js";
+import { listStatuses, processStartTimeMs, readStatus, writeStatus } from "../dist/status.js";
 
 /** In-memory stand-in for Raycast's LocalStorage. */
 function memoryStorage(initial = {}) {
@@ -194,11 +198,6 @@ test("a custom key isolates two histories in one extension", async () => {
 // unloaded. Nothing records the row at completion time — so the next launch
 // folds terminal status files into history.
 
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { reconcileHistory } from "../dist/history.js";
-import { writeStatus, readStatus, listStatuses } from "../dist/status.js";
 
 function statusFixture(overrides = {}) {
   const now = Date.now();
@@ -331,4 +330,190 @@ test("clear() cannot be undone by an add() that was already in flight", async ()
 
   const rows = await history.list();
   assert.ok(!rows.some((r) => r.id === "1"), "the pre-existing row must not come back");
+});
+
+// ─── Codex fix wave: reconciliation, batch dedupe, url policy ───────────────
+
+function raceDir() {
+  return mkdtempSync(join(tmpdir(), "history-race-"));
+}
+
+function raceStatus(dir, overrides = {}) {
+  const now = Date.now();
+  return {
+    schema: 1,
+    id: "dl-1",
+    pid: process.pid,
+    startedAtMs: processStartTimeMs(process.pid) ?? now,
+    state: "completed",
+    filename: "a.mp4",
+    outputPath: join(dir, "a.mp4"),
+    partPath: join(dir, "a.mp4.part"),
+    bytesDownloaded: 10,
+    startedAt: now,
+    heartbeatAt: now,
+    finishedAt: now,
+    ...overrides,
+  };
+}
+
+test("reconcileHistory does not delete a retry's status written while addMany awaited", async () => {
+  // The await on `addMany` is long enough for a user to press Retry: the id is
+  // reused, a new runner writes a fresh non-terminal status over the terminal
+  // one, and the unconditional delete that used to sit after the await threw
+  // away the LIVE attempt's status. The download then ran with nothing tracking
+  // it — invisible, uncancellable, reported as vanished.
+  //
+  // The interleaving is injected at the real await point rather than simulated.
+  const dir = raceDir();
+  try {
+    const original = raceStatus(dir, { state: "failed", startedAt: 1000, pid: 4242 });
+    writeStatus(original, dir);
+
+    let retried = null;
+    const history = {
+      async list() {
+        return [];
+      },
+      async addMany() {
+        // The retry lands here, mid-await, exactly as it would in the wild.
+        retried = raceStatus(dir, { state: "downloading", startedAt: 2000, pid: 5353, finishedAt: undefined });
+        writeStatus(retried, dir);
+      },
+      async add() {},
+      async remove() {},
+      async clear() {},
+      async clearOlderThan() {
+        return 0;
+      },
+    };
+
+    const folded = await reconcileHistory(history, { statusDir: dir });
+    assert.equal(folded, 1, "the original failure was still folded into history");
+
+    const survivor = readStatus("dl-1", dir);
+    assert.ok(survivor, "the retry's status file must survive reconciliation");
+    assert.equal(survivor.state, "downloading");
+    assert.equal(survivor.pid, 5353, "the surviving status is the retry, not the original");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reconcileHistory still clears the status it actually reconciled", async () => {
+  const dir = raceDir();
+  try {
+    writeStatus(raceStatus(dir, { state: "completed" }), dir);
+    const history = createDownloadHistory({ storage: memoryStorage(), lockDir: dir });
+    const folded = await reconcileHistory(history, { statusDir: dir });
+    assert.equal(folded, 1);
+    assert.equal(readStatus("dl-1", dir), null, "a reconciled status is cleared as before");
+    assert.equal(existsSync(join(dir, "dl-1.json")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("addMany collapses duplicate ids inside one batch", async () => {
+  // Two rows with one id made every later remove(id)/replace touch whichever
+  // it hit first, and made the list claim two downloads where there was one.
+  const dir = raceDir();
+  try {
+    const history = createDownloadHistory({ storage: memoryStorage(), lockDir: dir });
+    await history.addMany([
+      { id: "dup", filename: "new.mp4", outputPath: "/tmp/new", status: "completed" },
+      { id: "dup", filename: "old.mp4", outputPath: "/tmp/old", status: "failed" },
+      { id: "other", filename: "b.mp4", outputPath: "/tmp/b", status: "completed" },
+    ]);
+
+    const rows = await history.list();
+    assert.equal(rows.filter((r) => r.id === "dup").length, 1, "one row per id");
+    assert.equal(rows.length, 2);
+    assert.equal(rows.find((r) => r.id === "dup").filename, "new.mp4", "the first (newest) wins");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("looksLikeSignedUrl recognises the presigning schemes in use", () => {
+  assert.equal(
+    looksLikeSignedUrl(
+      "https://b.s3.amazonaws.com/k.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=deadbeef&X-Amz-Expires=900",
+    ),
+    true,
+  );
+  assert.equal(looksLikeSignedUrl("https://x.blob.core.windows.net/c/b?se=2026-01-01&sig=abc"), true);
+  assert.equal(looksLikeSignedUrl("https://cdn.example.com/f.mp4?token=abc123"), true);
+  assert.equal(looksLikeSignedUrl("https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz"), false);
+  assert.equal(looksLikeSignedUrl("https://example.com/f.mp4?utm_source=x&page=2"), false);
+});
+
+test("urlPolicy defaults to persisting the url verbatim", async () => {
+  // The historical behaviour, and the reason the guard is opt-in: flipping this
+  // would silently drop URLs an existing consumer reads back.
+  const dir = raceDir();
+  try {
+    const signed = "https://b.s3.amazonaws.com/k.mp4?X-Amz-Signature=deadbeef";
+    const history = createDownloadHistory({ storage: memoryStorage(), lockDir: dir });
+    await history.add({ id: "1", filename: "a", outputPath: "/tmp/a", status: "completed", url: signed });
+    assert.equal((await history.list())[0].url, signed);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('urlPolicy "omit-signed" keeps a signed url out of storage but keeps a plain one', async () => {
+  const dir = raceDir();
+  try {
+    const storage = memoryStorage();
+    const history = createDownloadHistory({ storage, lockDir: dir, urlPolicy: "omit-signed" });
+    await history.addMany([
+      {
+        id: "signed",
+        filename: "a",
+        outputPath: "/tmp/a",
+        status: "completed",
+        url: "https://b.s3.amazonaws.com/k.mp4?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIA",
+      },
+      { id: "plain", filename: "b", outputPath: "/tmp/b", status: "completed", url: "https://example.com/b.mp4" },
+    ]);
+
+    const rows = await history.list();
+    assert.equal(rows.find((r) => r.id === "signed").url, undefined, "the credential is not persisted");
+    assert.equal(rows.find((r) => r.id === "plain").url, "https://example.com/b.mp4");
+    // And not merely absent from the returned object — absent from the bytes.
+    assert.equal(storage._raw.get("download-history").includes("X-Amz-Signature"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('urlPolicy "omit-all" never stores a url; "throw-signed" is loud', async () => {
+  const dir = raceDir();
+  try {
+    const omitAll = createDownloadHistory({ storage: memoryStorage(), lockDir: dir, urlPolicy: "omit-all" });
+    await omitAll.add({
+      id: "1",
+      filename: "a",
+      outputPath: "/tmp/a",
+      status: "completed",
+      url: "https://example.com/a.mp4",
+    });
+    assert.equal((await omitAll.list())[0].url, undefined);
+
+    const loud = createDownloadHistory({ storage: memoryStorage(), lockDir: dir, urlPolicy: "throw-signed" });
+    await assert.rejects(
+      () =>
+        loud.add({
+          id: "1",
+          filename: "a",
+          outputPath: "/tmp/a",
+          status: "completed",
+          url: "https://b.s3.amazonaws.com/k?X-Amz-Signature=x",
+        }),
+      /Refusing to persist a signed URL/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -363,3 +363,111 @@ test("resolveDirectory throws instead of reporting when onUnsafe is throw", () =
   );
   assert.equal(calls.length, 0, "the throw is already the signal");
 });
+
+// ─── Codex fix wave: fallback containment, reservation TOCTOU, byte budget ───
+
+test("resolveDirectory refuses a fallback that sits outside allowedRoots", () => {
+  // A caller that declares custom roots and forgets to override `fallback` used
+  // to get ~/Downloads — outside the roots it had just restricted — and mkdir'd
+  // into existence. Silently landing files outside the allowlist defeats the
+  // only guarantee the function makes, so this is now loud.
+  const root = mkdtempSync(join(tmpdir(), "roots-"));
+  try {
+    assert.throws(
+      () => resolveDirectory(undefined, { allowedRoots: [root] }),
+      /outside the allowed roots/,
+      "the default ~/Downloads fallback is not inside the declared root",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveDirectory refuses a rejected input's fallback too, not just the input", () => {
+  const root = mkdtempSync(join(tmpdir(), "roots-"));
+  try {
+    assert.throws(
+      () => resolveDirectory("/etc/nope", { allowedRoots: [root], onUnsafe: "fallback" }),
+      /outside the allowed roots/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveDirectory accepts a fallback inside allowedRoots", () => {
+  const root = mkdtempSync(join(tmpdir(), "roots-"));
+  try {
+    const chosen = resolveDirectory(undefined, {
+      allowedRoots: [root],
+      fallback: join(root, "dl"),
+      create: false,
+    });
+    assert.equal(chosen, join(root, "dl"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveDirectory expands ~ in the fallback", () => {
+  const chosen = resolveDirectory(undefined, { fallback: "~/Downloads", create: false });
+  assert.equal(chosen, join(homedir(), "Downloads"));
+});
+
+test("uniquePath does not hand back a final path occupied after the sidecar was taken", () => {
+  // The state the post-acquisition recheck exists for: the sidecar is free (so
+  // `wx` succeeds) while the final name is occupied, which is exactly what a
+  // concurrent runner's `.part` -> final rename produces. Constructed directly
+  // here because the real interleaving is a sub-microsecond window between two
+  // syscalls; see test/races.test.mjs for the process-level attempt at it.
+  const dir = mkdtempSync(join(tmpdir(), "reserve-"));
+  try {
+    // `a.txt` taken, `a.txt.part` free -> the loop must skip to `a (1).txt`.
+    writeFileSync(join(dir, "a.txt"), "done");
+    const chosen = uniquePath(dir, "a.txt", { reserve: true });
+    assert.notEqual(chosen, join(dir, "a.txt"), "must never return an occupied final path");
+    assert.equal(chosen, join(dir, "a (1).txt"));
+    assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "done", "the completed file is untouched");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sanitizeFilename budgets an oversized extension instead of blowing past maxLength", () => {
+  // `extname` happily returns 301 bytes for `"a." + "b".repeat(300)`. Trimming
+  // only the stem left the total far over the limit — an ENAMETOOLONG at write
+  // time, long after the name looked settled.
+  const out = sanitizeFilename("a." + "b".repeat(300));
+  assert.ok(
+    Buffer.byteLength(out, "utf8") <= 255,
+    `expected <=255 bytes, got ${Buffer.byteLength(out, "utf8")}`,
+  );
+});
+
+test("sanitizeFilename reserves room for a caller's suffix", () => {
+  const out = sanitizeFilename("x".repeat(400) + ".mp4", { reserveBytes: 20 });
+  assert.ok(
+    Buffer.byteLength(out, "utf8") <= 235,
+    `expected <=235 bytes, got ${Buffer.byteLength(out, "utf8")}`,
+  );
+  assert.ok(out.endsWith(".mp4"));
+});
+
+test("uniquePath leaves room for its own numbering and sidecar suffix", () => {
+  // The name uniquePath returns is not the name that reaches the filesystem:
+  // a collision appends " (1000)" and reservation appends ".part". A name
+  // sanitized to exactly 255 bytes therefore produced a 266-byte sidecar.
+  const dir = mkdtempSync(join(tmpdir(), "budget-"));
+  try {
+    const chosen = uniquePath(dir, "y".repeat(400) + ".mp4", { reserve: true });
+    const component = chosen.slice(dir.length + 1);
+    const worst = `${component} (1000).part`;
+    assert.ok(
+      Buffer.byteLength(worst, "utf8") <= 255,
+      `worst-case component is ${Buffer.byteLength(worst, "utf8")} bytes: ${worst.slice(0, 40)}…`,
+    );
+    assert.ok(existsSync(`${chosen}.part`), "the sidecar was actually creatable");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -117,20 +117,37 @@ export interface ResolveDirectoryOptions {
  */
 export function resolveDirectory(input: string | undefined, options: ResolveDirectoryOptions = {}): string {
   const { allowedRoots = [homedir(), tmpdir()], onUnsafe = "fallback", create = true, onFallback } = options;
-  const fallback = options.fallback ?? join(homedir(), "Downloads");
+  // Expanded and resolved like any other input. It is a path from the same
+  // untrusted-ish place — a preference default, a constant in a consumer — and
+  // it was previously returned raw, so `"~/Downloads"` came back unexpanded.
+  const fallback = resolve(expandHome((options.fallback ?? join(homedir(), "Downloads")).trim()));
 
   const candidate = input?.trim() ? resolve(expandHome(input.trim())) : undefined;
 
+  const inRoots = (path: string): boolean => allowedRoots.some((root) => isContained(path, root));
+
   let chosen: string;
-  if (!candidate) {
-    chosen = fallback;
-  } else if (allowedRoots.some((root) => isContained(candidate, root))) {
+  if (candidate && inRoots(candidate)) {
     chosen = candidate;
-  } else if (onUnsafe === "throw") {
+  } else if (candidate && onUnsafe === "throw") {
     throw new Error(
       `Refusing to use "${candidate}": it is outside the allowed roots (${allowedRoots.join(", ")}).`,
     );
   } else {
+    // The fallback gets the SAME containment check the input got.
+    //
+    // It did not, and `mkdirSync` created it regardless — so a caller that
+    // declared custom `allowedRoots` and did not also override `fallback`
+    // silently got `~/Downloads`, a directory outside the roots it had just
+    // finished restricting, freshly created for it. The whole point of passing
+    // `allowedRoots` is that nothing lands outside them; an unchecked default
+    // is a hole in the one guarantee this function makes.
+    if (!inRoots(fallback)) {
+      throw new Error(
+        `Refusing to fall back to "${fallback}": it is outside the allowed roots ` +
+          `(${allowedRoots.join(", ")}). Pass a \`fallback\` that sits inside them.`,
+      );
+    }
     chosen = fallback;
   }
 
@@ -219,7 +236,24 @@ export interface UniquePathOptions {
 /** Find a non-colliding path in `dir` for `filename`. */
 export function uniquePath(dir: string, filename: string, options: UniquePathOptions = {}): string {
   const { style = "paren", startAt = 1, limit = 1000, reserve = false, reserveSuffix = ".part" } = options;
-  const safe = sanitizeFilename(filename);
+  const fallbackTimestamp = Date.now();
+  const fallbackLimit = 1000;
+
+  // Budget for what this function is about to ADD to the name.
+  //
+  // `sanitizeFilename` trims to 255 bytes — the APFS limit for one path
+  // component — but the name it returns is not the name that reaches the
+  // filesystem: a collision appends " (1000)" and reservation appends ".part".
+  // A name sanitized to exactly 255 bytes therefore produced a 266-byte
+  // sidecar and an ENAMETOOLONG at reservation time, long after the name looked
+  // settled. Reserve the overhead up front instead.
+  const normalNumbering = style === "paren" ? ` (${startAt + limit - 1})` : `-${startAt + limit - 1}`;
+  const fallbackNumbering = ` ${fallbackTimestamp} (${fallbackLimit - 1})`;
+  const widestNumbering =
+    byteLength(normalNumbering) >= byteLength(fallbackNumbering) ? normalNumbering : fallbackNumbering;
+  const safe = sanitizeFilename(filename, {
+    reserveBytes: byteLength(widestNumbering) + (reserve ? byteLength(reserveSuffix) : 0),
+  });
 
   const candidates: string[] = [join(dir, safe)];
   const [stem, ext] = splitExtension(safe);
@@ -227,10 +261,17 @@ export function uniquePath(dir: string, filename: string, options: UniquePathOpt
     candidates.push(join(dir, style === "paren" ? `${stem} (${n})${ext}` : `${stem}-${n}${ext}`));
   }
 
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) continue;
+  const claim = (candidate: string): boolean => {
+    if (existsSync(candidate)) {
+      // An empty sidecar cannot belong to a valid reservation once its final
+      // path exists: the reserving caller would have renamed it away. This is
+      // also the recovery path if post-acquisition cleanup below hit a transient
+      // unlink failure; a later allocation frees the otherwise orphaned claim.
+      if (reserve) releaseReservation(candidate, reserveSuffix);
+      return false;
+    }
 
-    if (!reserve) return candidate;
+    if (!reserve) return true;
 
     // Reservation mode. Checking `existsSync` and returning a path is a TOCTOU
     // race: a caller that only creates the file LATER (a download writing to
@@ -239,18 +280,49 @@ export function uniquePath(dir: string, filename: string, options: UniquePathOpt
     // overwrites the other. Claim the sidecar atomically with `wx` instead, so
     // exactly one caller can win a given name.
     const sidecar = `${candidate}${reserveSuffix}`;
-    if (existsSync(sidecar)) continue;
+    if (existsSync(sidecar)) return false;
     try {
       closeSync(openSync(sidecar, "wx"));
-      return candidate;
     } catch {
       // Lost the race; try the next candidate.
-      continue;
+      return false;
     }
+
+    // Re-check the FINAL path now that the sidecar is ours.
+    //
+    // The two checks above are not one atomic step. Between them another runner
+    // can finish and rename ITS `<candidate>.part` to `<candidate>` — which
+    // frees the sidecar name (so `wx` succeeds for us) at the same instant it
+    // occupies the final name. We would then hand back a filename holding
+    // somebody's completed download, and the caller would rename over it.
+    if (sidecar !== candidate && existsSync(candidate)) {
+      try {
+        unlinkSync(sidecar);
+      } catch {
+        // A later allocation that sees the occupied final path calls
+        // `releaseReservation`, so a transient cleanup failure cannot burn the
+        // unreturned name forever.
+      }
+      return false;
+    }
+
+    return true;
+  };
+
+  for (const candidate of candidates) {
+    if (claim(candidate)) return candidate;
   }
 
-  // Pathological case: never loop forever and never return a colliding path.
-  return join(dir, `${stem} ${Date.now()}${ext}`);
+  // Pathological case: the ordinary sequence is full. Timestamp-based names
+  // avoid walking an unbounded user-controlled suffix range, but still use the
+  // same collision check and atomic reservation as every normal candidate.
+  for (let n = 0; n < fallbackLimit; n++) {
+    const suffix = n === 0 ? ` ${fallbackTimestamp}` : ` ${fallbackTimestamp} (${n})`;
+    const candidate = join(dir, `${stem}${suffix}${ext}`);
+    if (claim(candidate)) return candidate;
+  }
+
+  throw new Error(`Could not find an available filename for "${filename}" after ${fallbackLimit} fallback attempts.`);
 }
 
 /**
@@ -259,8 +331,14 @@ export function uniquePath(dir: string, filename: string, options: UniquePathOpt
  * Never returns an empty string — an empty filename would silently become the
  * directory itself at the join() call site.
  */
-export function sanitizeFilename(name: string, options: { maxLength?: number } = {}): string {
-  const { maxLength = 255 } = options;
+export function sanitizeFilename(
+  name: string,
+  options: { maxLength?: number; reserveBytes?: number } = {},
+): string {
+  const { maxLength = 255, reserveBytes = 0 } = options;
+  // Room the CALLER still needs — a " (12)" collision suffix, a ".part"
+  // sidecar. Zero by default so an existing consumer's filenames do not move.
+  const budget = Math.max(1, maxLength - Math.max(0, reserveBytes));
 
   let out = name
     .replace(/[/\\]/g, "-") // path separators → visible, non-structural
@@ -277,10 +355,18 @@ export function sanitizeFilename(name: string, options: { maxLength?: number } =
   // component to 255 bytes, so a title in CJK or with emoji can sit well under
   // 255 characters and still blow the limit — an ENAMETOOLONG at write time,
   // long after the name was chosen.
-  if (byteLength(out) > maxLength) {
+  if (byteLength(out) > budget) {
     const [stem, ext] = splitExtension(out);
-    const room = Math.max(1, maxLength - byteLength(ext));
-    out = truncateToBytes(stem, room) + ext;
+    // The extension can blow the budget on its own — `"a." + "b".repeat(300)`
+    // is a legal filename and `extname` returns all 301 bytes of it. Shrinking
+    // only the stem then returned a name still far over the limit, which is the
+    // ENAMETOOLONG this whole block exists to prevent. So the extension gets at
+    // most half the budget and the stem takes what is left.
+    const ext2 = byteLength(ext) > Math.floor(budget / 2) ? truncateToBytes(ext, Math.floor(budget / 2)) : ext;
+    const room = Math.max(1, budget - byteLength(ext2));
+    out = truncateToBytes(stem, room) + ext2;
+    // Belt: `Math.max(1, …)` above can still overshoot for a pathological budget.
+    if (byteLength(out) > budget) out = truncateToBytes(out, budget);
   }
 
   return out;

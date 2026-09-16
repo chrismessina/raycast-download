@@ -14,12 +14,17 @@
  *    Conflated, a hung-but-alive transfer reads as healthy forever.
  *  - Adoption takes a lease. Two Raycast windows must not both resume the same
  *    download and write the same file.
+ *  - Every read-modify-write of a status file holds a cross-process lock. A
+ *    command reading `downloading`, the runner writing `completed`, then the
+ *    command writing its stale snapshot back is a LOST COMPLETION, and the two
+ *    are separate OS processes, so no in-process mutex can see it.
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { withFileLockSync } from "./lock";
 import { writeSecretFile } from "./paths";
 
 export type DownloadState = "starting" | "generating" | "downloading" | "finalizing" | "completed" | "failed" | "cancelled";
@@ -120,11 +125,42 @@ export function statusPath(id: string, dir?: string): string {
 }
 
 /**
+ * The cross-process lock guarding one download's status file.
+ *
+ * A sibling of the status file rather than a single global lock: two unrelated
+ * downloads finishing at the same moment must not serialize against each other.
+ */
+export function statusLockPath(id: string, dir?: string): string {
+  return `${statusPath(id, dir)}.lock`;
+}
+
+/**
+ * Run `fn` while holding a download's status lock.
+ *
+ * Exported so a caller that must read a status, decide something, and act on it
+ * can do so without the runner changing the file underneath — `reconcileHistory`
+ * deleting a status only if it is still the attempt it reconciled, for instance.
+ */
+export function withStatusLock<T>(id: string, dir: string | undefined, fn: () => T): T {
+  return withFileLockSync(statusLockPath(id, dir), fn);
+}
+
+/**
  * Write atomically: a full file appears under the final name, or nothing does.
  * `renameSync` within one directory is atomic on macOS/APFS, so a concurrent
  * reader sees either the previous status or the new one — never a partial write.
  */
 export function writeStatus(
+  status: DownloadStatus,
+  dir?: string,
+  options: { clearLease?: boolean } = {},
+): void {
+  // Held across the read-and-write below, and reentrant so `acquireLease` can
+  // hold the same lock around its own read-modify-write.
+  withFileLockSync(statusLockPath(status.id, dir), () => writeStatusLocked(status, dir, options));
+}
+
+function writeStatusLocked(
   status: DownloadStatus,
   dir?: string,
   options: { clearLease?: boolean } = {},
@@ -140,12 +176,26 @@ export function writeStatus(
   // owns. So lease fields survive unless the writer sets them itself, or asks
   // to clear them (which is how `releaseLease` gives one up — otherwise the
   // preservation below would make releasing impossible).
+  const existing = readStatusFile(target);
   let next = status;
   if (!options.clearLease && status.ownerId === undefined && status.leaseUntil === undefined) {
-    const existing = readStatusFile(join(dir ?? statusDir(), `${status.id}.json`));
     if (existing?.ownerId !== undefined) {
       next = { ...status, ownerId: existing.ownerId, leaseUntil: existing.leaseUntil };
     }
+  }
+
+  // The runner's periodic heartbeat is an in-memory snapshot. If cancellation
+  // settled that same attempt while it was between heartbeats, letting that
+  // snapshot write would resurrect a terminal download. A different process
+  // identity is a deliberate Retry, so it remains free to reuse the id.
+  if (
+    existing &&
+    isTerminal(existing.state) &&
+    !isTerminal(next.state) &&
+    existing.pid === next.pid &&
+    existing.startedAtMs === next.startedAtMs
+  ) {
+    next = existing;
   }
 
   const tmp = `${target}.${process.pid}.tmp`;
@@ -161,7 +211,26 @@ function readStatusFile(path: string): DownloadStatus | null {
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as DownloadStatus;
     // A file from a future version may not mean what this code thinks it means.
-    if (parsed?.schema !== 1) return null;
+    if (
+      parsed?.schema !== 1 ||
+      typeof parsed.id !== "string" ||
+      !Number.isInteger(parsed.pid) ||
+      parsed.pid <= 0 ||
+      !Number.isFinite(parsed.startedAtMs) ||
+      !TERMINAL.has(parsed.state) &&
+        parsed.state !== "starting" &&
+        parsed.state !== "generating" &&
+        parsed.state !== "downloading" &&
+        parsed.state !== "finalizing" ||
+      typeof parsed.filename !== "string" ||
+      typeof parsed.outputPath !== "string" ||
+      typeof parsed.partPath !== "string" ||
+      !Number.isFinite(parsed.bytesDownloaded) ||
+      !Number.isFinite(parsed.heartbeatAt) ||
+      !Number.isFinite(parsed.startedAt)
+    ) {
+      return null;
+    }
     return parsed;
   } catch {
     // Missing, unreadable, or mid-rename — all "no status right now".
@@ -334,29 +403,42 @@ export interface AcquireLeaseOptions {
 export function acquireLease(id: string, options: AcquireLeaseOptions): DownloadStatus | null {
   const { ownerId, leaseMs = 30_000, dir, now = Date.now() } = options;
 
-  const current = readStatus(id, dir);
-  if (!current) return null;
+  // The read, the modify and the write all happen under one lock.
+  //
+  // Without it this function silently erased the runner's work: it read
+  // `downloading`, the runner wrote `completed` a moment later, and then this
+  // wrote its stale snapshot back — resurrecting a finished download as
+  // in-flight, with a lease on it. The window is sub-millisecond and the two
+  // writers are different processes, which is exactly the combination that
+  // makes it look impossible right up until a user reports a download that
+  // finished and then un-finished.
+  return withFileLockSync(statusLockPath(id, dir), () => {
+    const current = readStatus(id, dir);
+    if (!current) return null;
 
-  const heldByOther =
-    current.ownerId !== undefined &&
-    current.ownerId !== ownerId &&
-    current.leaseUntil !== undefined &&
-    current.leaseUntil > now;
-  if (heldByOther) return null;
+    const heldByOther =
+      current.ownerId !== undefined &&
+      current.ownerId !== ownerId &&
+      current.leaseUntil !== undefined &&
+      current.leaseUntil > now;
+    if (heldByOther) return null;
 
-  writeStatus({ ...current, ownerId, leaseUntil: now + leaseMs }, dir);
+    writeStatus({ ...current, ownerId, leaseUntil: now + leaseMs }, dir);
 
-  const confirmed = readStatus(id, dir);
-  return confirmed?.ownerId === ownerId ? confirmed : null;
+    const confirmed = readStatus(id, dir);
+    return confirmed?.ownerId === ownerId ? confirmed : null;
+  });
 }
 
 export function releaseLease(id: string, ownerId: string, dir?: string): void {
-  const current = readStatus(id, dir);
-  if (!current || current.ownerId !== ownerId) return;
-  // `clearLease` is required: writeStatus otherwise preserves lease fields it
-  // does not see, which is right for the runner heartbeat but would make
-  // releasing a lease impossible.
-  writeStatus({ ...current, ownerId: undefined, leaseUntil: undefined }, dir, { clearLease: true });
+  withFileLockSync(statusLockPath(id, dir), () => {
+    const current = readStatus(id, dir);
+    if (!current || current.ownerId !== ownerId) return;
+    // `clearLease` is required: writeStatus otherwise preserves lease fields it
+    // does not see, which is right for the runner heartbeat but would make
+    // releasing a lease impossible.
+    writeStatus({ ...current, ownerId: undefined, leaseUntil: undefined }, dir, { clearLease: true });
+  });
 }
 
 export interface WatchOptions {
@@ -500,34 +582,42 @@ export function pruneStatuses(options: PruneOptions = {}): number {
   const directory = dir ?? statusDir();
   let removed = 0;
 
-  for (const status of listStatuses(directory)) {
-    const age = now - (status.finishedAt ?? status.heartbeatAt ?? status.startedAt);
-    const abandoned = !isTerminal(status.state) && !isAlive(status);
+  for (const listed of listStatuses(directory)) {
+    withStatusLock(listed.id, directory, () => {
+      // `listed` was necessarily read before this lock. A Retry may have
+      // claimed its id in that window, so decide only from the locked reread.
+      const status = readStatus(listed.id, directory);
+      if (!status) return;
 
-    // An empty `.part` is not a partial download — it is the touched-and-died
-    // remains of a runner that crashed on startup. Nothing can resume from zero
-    // bytes, so holding it for the retention window just leaves an inexplicable
-    // file sitting in the user's Downloads folder. Reap it as soon as the
-    // transfer is known dead. (Observed 2026-08-01: a 0-byte `.part` next to
-    // every failed download, from a runner that could not load its own modules.)
-    if (!isAlive(status) && status.partPath) {
-      try {
-        if (existsSync(status.partPath) && statSync(status.partPath).size === 0) unlinkSync(status.partPath);
-      } catch {
-        // Best effort.
-      }
-    }
+      const age = now - (status.finishedAt ?? status.heartbeatAt ?? status.startedAt);
+      const alive = isAlive(status);
+      const abandoned = !isTerminal(status.state) && !alive;
 
-    if (age > olderThanMs || (abandoned && age > olderThanMs)) {
-      // Only reap the partial once nothing can resume from it.
-      try {
-        if (status.partPath && existsSync(status.partPath)) unlinkSync(status.partPath);
-      } catch {
-        // Best effort.
+      // An empty `.part` is not a partial download — it is the touched-and-died
+      // remains of a runner that crashed on startup. Nothing can resume from zero
+      // bytes, so holding it for the retention window just leaves an inexplicable
+      // file sitting in the user's Downloads folder. Reap it as soon as the
+      // transfer is known dead. (Observed 2026-08-01: a 0-byte `.part` next to
+      // every failed download, from a runner that could not load its own modules.)
+      if (!alive && status.partPath) {
+        try {
+          if (existsSync(status.partPath) && statSync(status.partPath).size === 0) unlinkSync(status.partPath);
+        } catch {
+          // Best effort.
+        }
       }
-      clearStatus(status.id, directory);
-      removed++;
-    }
+
+      if (age > olderThanMs || (abandoned && age > olderThanMs)) {
+        // Only reap the partial once nothing can resume from it.
+        try {
+          if (status.partPath && existsSync(status.partPath)) unlinkSync(status.partPath);
+        } catch {
+          // Best effort.
+        }
+        clearStatus(status.id, directory);
+        removed++;
+      }
+    });
   }
 
   return removed;
