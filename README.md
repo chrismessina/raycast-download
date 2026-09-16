@@ -66,7 +66,7 @@ Some environments can't resolve a process's start time at all. Two different que
 
 **Layer B — everything else** (`paths`, `errors`, `progress`, `history`): useful to any extension that puts a file on disk, however it got the bytes.
 
-The split is deliberate. A tool that owns its own transport — `ipatool`, say, which never exposes a URL, picks its own output path, and emits no progress — can consume Layer B without being forced through a URL-shaped API that does not fit it.
+The split is deliberate. A tool that owns its own transport — a vendor CLI, say, which never exposes a URL, picks its own output path, and emits no progress — can consume Layer B without being forced through a URL-shaped API that does not fit it.
 
 ## Design notes
 
