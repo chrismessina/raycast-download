@@ -203,25 +203,29 @@ export async function reconcileHistory<M = unknown>(
       s.state === "cancelled",
   );
 
-  if (finished.length === 0) return 0;
-
-  await history.addMany(
-    finished.map((s) => ({
-      id: s.id,
-      filename: s.filename,
-      outputPath: s.outputPath,
-      status:
-        s.state === "completed"
-          ? ("completed" as const)
-          : (s.state as "failed" | "cancelled"),
-      bytesDownloaded: s.bytesDownloaded,
-      error: s.error
-        ? { code: s.error.code as DownloadErrorCode, message: s.error.message }
-        : undefined,
-      timestamp: s.finishedAt ?? s.heartbeatAt ?? s.startedAt,
-      meta: toMeta?.(s),
-    })),
-  );
+  // NOT `if (finished.length === 0) return 0` — that early return sat above the
+  // `clearAbandoned` loop, so the one case clearAbandoned exists for (a status
+  // directory holding nothing but a dead in-progress attempt) returned without
+  // clearing anything.
+  if (finished.length > 0) {
+    await history.addMany(
+      finished.map((s) => ({
+        id: s.id,
+        filename: s.filename,
+        outputPath: s.outputPath,
+        status:
+          s.state === "completed"
+            ? ("completed" as const)
+            : (s.state as "failed" | "cancelled"),
+        bytesDownloaded: s.bytesDownloaded,
+        error: s.error
+          ? { code: s.error.code as DownloadErrorCode, message: s.error.message }
+          : undefined,
+        timestamp: s.finishedAt ?? s.heartbeatAt ?? s.startedAt,
+        meta: toMeta?.(s),
+      })),
+    );
+  }
 
   // Only clear the status we actually folded in.
   //
@@ -263,6 +267,12 @@ export async function reconcileHistory<M = unknown>(
         if (!current) return;
         if (s.startedAt !== undefined && current.startedAt !== s.startedAt) return;
         if (s.pid !== undefined && current.pid !== s.pid) return;
+        // The SAME attempt can also have finished during the await, not just
+        // been replaced by a retry. It is then terminal and not alive, but it
+        // was not in the `finished` snapshot — so no history row exists for it.
+        // Deleting it here loses the download outright. Leave it for the next
+        // reconcile, which folds it in properly.
+        if (status.isTerminal(current.state)) return;
         if (status.isAlive(current)) return;
         status.clearStatus(s.id, statusDir);
       });
@@ -465,7 +475,12 @@ export function createDownloadHistory<M = unknown>(
 
   return {
     async list() {
-      return withLock(async () => normalize(await readAll()));
+      // `screenStored` here too, not only on the write-merge path: a read-only
+      // session never reaches a merge, so a row persisted under an earlier
+      // policy was handed straight back to the caller with its signed URL
+      // intact. The policy is a promise about what leaves this module, not just
+      // about what enters storage.
+      return withLock(async () => normalize(await readAll()).map(screenStored));
     },
 
     async add(record) {
