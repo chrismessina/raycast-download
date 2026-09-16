@@ -2,3 +2,10 @@ node_modules/
 dist/
 *.log
 .DS_Store
+
+# Working notes and local agent config — never on the public repo.
+# HANDOFF.md carries machine-absolute paths and session ids.
+HANDOFF.md
+.claude/settings.local.json
+# Working plans — branch state and task ordering, same shape as HANDOFF.md.
+docs/plans/

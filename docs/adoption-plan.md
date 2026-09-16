@@ -239,10 +239,21 @@ runtime dependencies because `runner.bundle.js` must bundle standalone for the d
 process; coupling the runner to the kit for fifteen lines of arithmetic is the worse trade.
 
 **History URL canonicalization is a per-consumer toggle, not a global normalizer.** Canonical
-URLs are wanted for dedupe and counts, but the module already refuses to persist signed URLs,
-which are bearer credentials. Stripping query params is simultaneously what would make a signed
-URL safe to store and what would collide two genuinely different downloads. So it is opt-in per
-consumer, with the security posture named at the call site rather than assumed by the library.
+URLs are wanted for dedupe and counts, but a signed URL is a bearer credential. Stripping query
+params is simultaneously what would make a signed URL safe to store and what would collide two
+genuinely different downloads. So it is opt-in per consumer, with the security posture named at
+the call site rather than assumed by the library.
+
+**Correction (2026-09-08): the module does NOT refuse signed URLs by default.** An earlier
+version of this paragraph said "the module already refuses to persist signed URLs". It did not,
+and nothing in `history.ts` ever checked — `url?: string` was persisted verbatim. Keeping
+credentials out of history is the CALLER's responsibility, and that is now what the JSDoc on
+`DownloadRecord.url` and the header of `src/index.ts` say. For callers who want it enforced,
+`createDownloadHistory({ urlPolicy: "omit-signed" })` screens each record with
+`looksLikeSignedUrl()` and drops the URL; `"omit-all"` never stores one; `"throw-signed"` turns
+it into a loud programming error. The default is `"allow"` — persist what you pass — because
+switching an existing consumer's behaviour silently is the one thing worse than the wrong
+comment.
 
 **A "Download Manager" shim extension is rejected.** Extension A deeplinking into a Download
 Manager command does not help: that command is also unloaded on dismissal, so it still needs

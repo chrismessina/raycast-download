@@ -74,7 +74,7 @@ Each of these exists because the obvious implementation is wrong in a way that o
 
 **Process identity is `(pid, startTime)`, never a bare pid.** macOS `kern.maxproc` is 16000, so pids get recycled. A liveness check of `kill(pid, 0)` alone answers "does *some* process have this pid" — and cancelling on that basis can `kill(-pid)` an unrelated process group.
 
-**Credentials never touch argv.** `ps` is world-readable. Measured: a URL passed as a curl argument is visible to any process on the machine; passed via a `0600` config file on stdin, it is not. Signed URLs are bearer credentials, so the config-file channel is a requirement rather than a preference.
+**Credentials never touch argv.** `ps` is world-readable. Measured: a URL passed as a curl argument is visible to any process on the machine; written to a `0600` config file and passed by path as `curl -K <file>`, it is not. The config is unlinked as soon as curl's first output byte proves it has been read. Signed URLs are bearer credentials, so the config-file channel is a requirement rather than a preference.
 
 **Timeouts are throughput-based, not wall-clock.** `--max-time` counts machine sleep against the budget, so a laptop closed for ten minutes guarantees a spurious failure on a healthy transfer. `--speed-limit`/`--speed-time` measure actual throughput and are sleep-tolerant.
 
@@ -100,7 +100,7 @@ Stated plainly so a consumer doesn't discover them the hard way.
 
 **Bundling.** `startDownload` resolves `runner.js` from `__dirname`. If a consumer inlines `detach.js` into a single bundle without copying `dist/runner.js` alongside, it throws "runner not found" — loudly, not silently. Keep the package external, or copy the runner into the bundle directory.
 
-**`npm test` runs against the built `dist`.** Run `npm run build` first, or you may be testing stale output. The integration suite hits the real network; set `SKIP_INTEGRATION=1` to skip it.
+**`npm test` runs against the built `dist`** — the script builds first, so it is never stale, but invoking `node --test` directly is. The integration suite hits the real network; set `SKIP_INTEGRATION=1` to skip it.
 
 ## API
 
