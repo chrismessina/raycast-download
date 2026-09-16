@@ -35,8 +35,8 @@ heartbeat while "should I signal this pid?" refuses outright, because guessing w
 liveness costs a mislabelled status and guessing wrong about identity kills an unrelated
 process tree.
 
-Zero runtime dependencies. `@raycast/api` is a peer, loaded lazily so the runner and the tests
-work outside a Raycast host.
+Zero runtime dependencies. `@raycast/api` is a peer accepting `^1.0.0 || ^2.0.0`, loaded lazily
+so the runner and the tests work outside a Raycast host. The suite is run against v2.
 
 ### Notes for the first consumers
 
