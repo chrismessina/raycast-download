@@ -20,7 +20,12 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # macOS, not ubuntu: `package.json` declares `"os": ["darwin", "win32"]`
+    # because Raycast only runs there, and `npm ci` enforces that field against
+    # the ROOT package — so a Linux runner fails EBADPLATFORM before it can
+    # install anything. Free for a public repo, and it builds the artifact on a
+    # platform the package actually supports.
+    runs-on: macos-latest
     permissions:
       contents: read
       id-token: write # npm provenance
