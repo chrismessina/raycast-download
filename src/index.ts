@@ -1,5 +1,5 @@
 /**
- * @chrismessina/raycast-download
+ * @chrismessina/raycast-downloader
  *
  * Downloads for Raycast extensions that survive the window closing.
  *

@@ -93,7 +93,7 @@ export function statusDir(override?: string): string {
       // Outside a Raycast host (tests, the runner): fall through.
     }
   }
-  const dir = join(base ?? join(homedir(), ".raycast-download"), "downloads");
+  const dir = join(base ?? join(homedir(), ".raycast-downloader"), "downloads");
   mkdirSync(dir, { recursive: true });
   return dir;
 }

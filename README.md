@@ -1,4 +1,4 @@
-# @chrismessina/raycast-download
+# @chrismessina/raycast-downloader
 
 Downloads for Raycast extensions that survive the window closing.
 
@@ -13,7 +13,7 @@ An in-flight stream to disk is torn down mid-write, leaving a truncated file. `n
 So the transfer runs in a **detached child process** that outlives the command, reporting through a status file on disk rather than through memory.
 
 ```ts
-import { startDownload, watchStatus } from "@chrismessina/raycast-download";
+import { startDownload, watchStatus } from "@chrismessina/raycast-downloader";
 
 const ticket = await startDownload({
   url: signedUrl,
@@ -115,7 +115,7 @@ detach    startDownload · killDownload · reconcile · runnerPath
 curl      buildCurlConfig · parseCurlMeter · parseWriteOut · classifyCurlFailure
 ```
 
-Import from the root or from a subpath (`@chrismessina/raycast-download/paths`).
+Import from the root or from a subpath (`@chrismessina/raycast-downloader/paths`).
 
 ## Notes for consumers
 

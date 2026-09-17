@@ -31,7 +31,7 @@ const bundle = join(root, "dist", "runner.bundle.js");
 
 function isolatedCopy() {
   const dir = mkdtempSync(join(tmpdir(), "runner-bundle-"));
-  const dest = join(dir, "raycast-download-runner.js");
+  const dest = join(dir, "raycast-downloader-runner.js");
   copyFileSync(bundle, dest);
   return { dir, dest };
 }

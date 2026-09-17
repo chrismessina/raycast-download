@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`@chrismessina/raycast-download` — downloads for Raycast extensions that survive the window
+`@chrismessina/raycast-downloader` — downloads for Raycast extensions that survive the window
 closing. Zero runtime dependencies; `@raycast/api` is a peer, loaded lazily.
 
 Public API and design rationale: `README.md`. Current branch state, open tasks and publish

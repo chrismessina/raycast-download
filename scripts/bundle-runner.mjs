@@ -11,7 +11,7 @@
  *
  *     Error: Cannot find module './curl'
  *     Require stack:
- *     - .../extensions/fathom/assets/raycast-download-runner.js
+ *     - .../extensions/fathom/assets/raycast-downloader-runner.js
  *
  * The runner died on that line every single time, ~8s after spawn, having
  * written no status of its own. The parent saw only "runner vanished without

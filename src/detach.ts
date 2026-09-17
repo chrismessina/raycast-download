@@ -128,20 +128,20 @@ function runnerCandidates(): string[] {
 
   return [
     // Explicit override, for layouts nothing here anticipates.
-    process.env.RAYCAST_DOWNLOAD_RUNNER,
+    process.env.RAYCAST_DOWNLOADER_RUNNER,
     // Bundled Raycast extension that copies the runner into assets/ at build
     // time (see the `copy-runner` script in the consumer's package.json).
     // This is the copied-artifact case, so it must be the self-contained
     // bundle — a copied `runner.js` cannot resolve its siblings.
-    assetsPath ? join(assetsPath, "raycast-download-runner.js") : undefined,
+    assetsPath ? join(assetsPath, "raycast-downloader-runner.js") : undefined,
     // Normal `node_modules` install, and the package's own tests. Both forms
     // work in place; prefer the bundle so what runs matches what ships.
     join(__dirname, "runner.bundle.js"),
     join(__dirname, "runner.js"),
     // Bundled consumer whose dependencies still exist on disk.
-    join(process.cwd(), "node_modules", "@chrismessina", "raycast-download", "dist", "runner.bundle.js"),
-    join(process.cwd(), "node_modules", "@chrismessina", "raycast-download", "dist", "runner.js"),
-    join(process.cwd(), "assets", "raycast-download-runner.js"),
+    join(process.cwd(), "node_modules", "@chrismessina", "raycast-downloader", "dist", "runner.bundle.js"),
+    join(process.cwd(), "node_modules", "@chrismessina", "raycast-downloader", "dist", "runner.js"),
+    join(process.cwd(), "assets", "raycast-downloader-runner.js"),
     join(process.cwd(), "runner.bundle.js"),
     join(process.cwd(), "runner.js"),
   ].filter((candidate): candidate is string => Boolean(candidate));
@@ -213,7 +213,7 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
         .map((p) => `  - ${p}`)
         .join("\n")}\n` +
         `If this extension is bundled, copy the package's dist/runner.bundle.js next to the bundle, ` +
-        `or set RAYCAST_DOWNLOAD_RUNNER to its path.`,
+        `or set RAYCAST_DOWNLOADER_RUNNER to its path.`,
     );
   }
 
