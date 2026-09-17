@@ -189,10 +189,20 @@ unfiltered. Every batch consumer will hand-roll the same counter+scheduler. Wort
 Fetch migration. No concurrency limiter (deliberate — that's a consumer preference), but say so
 in the README.
 
-**#3 `reconcile` may misreport a resumed download** (`detach.ts:243-245`). `totalBytes` is
-written twice with different meanings across the resume path (`runner.ts:168` = existing +
-Range-remaining; `runner.ts:272` = expected/final), and `reconcile`'s equality check assumes one.
-INFERRED, not reproduced. Needs a test killing a resumed transfer during `finalizing`.
+**#3 `reconcile` may misreport a resumed download — FIXED 2026-09-16.** `totalBytes` was written
+with two different meanings across the resume path — existing bytes plus Range-remaining in one
+place, the caller's expectation in another — while `reconcile`'s equality check assumed one of
+them. The failing case was sharper than the original inference: with `sizeCheck: "advisory"` a
+clean transfer producing fewer bytes than `expectedBytes` is deliberately publishable, but
+`finalizing` recorded the *expectation*, so a crash after the rename made `reconcile` compare the
+real file against a number it was never going to match and report a failure for an already-correct
+file. The runner now records the size it actually publishes (`runner.ts:347` persists `finalizing`
+with `totalBytes: finalBytes`), which is the value `reconcile` (`detach.ts:483`) compares against.
+Covered by a test that was confirmed failing first.
+
+> The line numbers originally cited here (`detach.ts:243-245`, `runner.ts:272`) drifted onto
+> unrelated code during the fix wave — they still resolved, which is what made them dangerous.
+> Verify a citation by printing the line before trusting it.
 
 **#4 `resolveDirectory`'s fallback is silent — FIXED 2026-09-08.** A user whose configured
 directory was rejected got files in `~/Downloads` with no explanation, and read it as the
@@ -205,7 +215,10 @@ supplied (nothing was attempted, so there is no override to explain) and `onUnsa
 bypassing the atomic claim. Either an `overwrite: true` option on `uniquePath` that still
 reserves, or a README note.
 
-**#7 README `startAt` note is half-wrong** — the default is already `1`, so Fetch can omit it.
+**#7 README `startAt` note is incomplete** — `README.md:141` describes what `startAt` is for but
+never states the default, which is already `1` (`src/paths.ts:238`), so Fetch can omit it. The note
+is not wrong, just missing the one fact a caller needs to decide whether to pass the option.
+Verified still open 2026-09-16.
 
 ---
 

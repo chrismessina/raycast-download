@@ -7,6 +7,11 @@ Public API and design rationale: `README.md`. Current branch state, open tasks a
 gating: `HANDOFF.md` (read it before touching anything — it is written per-wave and is more
 current than this file).
 
+Documented solutions to past problems (bugs, workflow patterns) live in `docs/solutions/`,
+organized by category with YAML frontmatter (`module`, `tags`, `problem_type`) — relevant when
+implementing or debugging in a documented area. `CONCEPTS.md` holds the shared domain
+vocabulary: runner, status file, Layer A/B, reservation, lease, attempt identity.
+
 ## Commands
 
 ```bash
