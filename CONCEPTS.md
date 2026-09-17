@@ -43,14 +43,28 @@ URL, choose their own destination, and report no progress. Such a tool can use L
 while Layer A is structurally unusable to it. So Layer B must never depend on Layer A — collapsing
 them would force every caller through a URL-shaped interface that does not fit all of them.
 
+## Partial file
+
+The incomplete copy a transfer writes to, under a name distinct from the one the user asked for,
+until the result has been verified and can be published under the real name.
+
+It carries three jobs at once, which is why it is worth naming. It holds the bytes a later attempt
+resumes from; it doubles as the [reservation](#reservation) on the final name; and its presence
+after a failure is the signal that resuming is worthwhile at all. Those jobs conflict: the bytes
+are only resumable if every byte in the file genuinely belongs to the wanted file, so anything a
+failed attempt wrote — an error page, a redirect body — must be rolled back before the file is left
+behind, and a rollback that cannot be verified means the file must be discarded instead.
+Publishing is a rename of this file, which is what makes the final name appear only once the
+content behind it is whole.
+
 ## Reservation
 
 An atomic claim on a filename, made before anything is written to it.
 
 Picking an unused name and returning it is not enough when the caller writes later: two callers can
 inspect the same directory in the same moment, see the same name free, and both take it. A
-reservation instead creates a marker file in a way the filesystem guarantees only one caller can
-win, so the name is genuinely held rather than merely observed to be free.
+reservation instead creates the [partial file](#partial-file) as its marker, in a way the
+filesystem guarantees only one caller can win, so the name is genuinely held rather than merely observed to be free.
 
 Whoever takes a reservation is responsible for releasing it if the work does not proceed. An
 abandoned reservation burns that filename for later callers.
