@@ -33,7 +33,9 @@ watchStatus(ticket.id, {
 
 **Survives:** Raycast dismissal, the command being unloaded, the parent process exiting.
 
-**Does not survive** (without user action): machine sleep, power loss, unattended network drops. Partial files are always retained, so an interrupted transfer resumes via HTTP Range instead of starting over.
+**Does not survive** (without user action): machine sleep, power loss, unattended network drops. A partial file is retained so an interrupted transfer resumes via HTTP Range instead of starting over.
+
+**One exception, and it is deliberate:** a partial is discarded when it cannot be proven safe to resume from. An unfollowed 3xx leaves the redirect body in the `.part` file; that tail is rolled back, and if the rollback cannot be verified the partial is deleted rather than kept. `curl -C -` appends from the file's current size, so resuming onto unverified bytes would splice the real file after redirect HTML and publish it under the user's filename. Progress is recoverable; a corrupt file is not. If the partial cannot be deleted either, the status records the failure and consumers must not resume that path.
 
 This is stated narrowly on purpose. Detached spawn solves parent-process-exit — the problem Raycast creates. It is not a download supervisor.
 

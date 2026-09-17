@@ -15,10 +15,13 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  fstatSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   realpathSync,
   statSync,
+  truncateSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -391,4 +394,85 @@ function truncateToBytes(value: string, maxBytes: number): string {
     used += size;
   }
   return result || value.slice(0, 1);
+}
+
+/**
+ * Roll a `.part` file back to a byte count that is known good.
+ *
+ * Used after an unfollowed 3xx: curl writes the redirect BODY into the partial,
+ * and on a RESUMED transfer the bytes before it are the user's real progress,
+ * so the tail is removed rather than the whole file.
+ *
+ * Returns false when the partial cannot be left in a state that is safe to
+ * resume from, and does everything it can to make it non-resumable first. A
+ * resume runs `curl -C -`, which appends from the file's CURRENT size, so a
+ * partial still carrying redirect HTML gets the real recording spliced onto the
+ * end of it and published under the user's filename. Losing progress is
+ * recoverable; a corrupt media file is not.
+ *
+ * Three things here are load-bearing:
+ *
+ *  - **Every operation is bound to ONE open file descriptor.** Doing this by
+ *    pathname across stat / truncate / re-stat is a TOCTOU: another attempt or
+ *    an external actor can replace the file mid-sequence, and the cleanup then
+ *    lands on a healthy partial belonging to someone else.
+ *  - **The size is VERIFIED after truncating.** A truncate that throws is
+ *    obvious; one that leaves the file longer than asked is not, and only the
+ *    second corrupts the next resume.
+ *  - **`keepBytes` is validated before anything destructive runs.** It is a
+ *    caller-supplied number on an exported function, and a negative value
+ *    reaches `ftruncateSync`, throws, and would otherwise fall through to the
+ *    cleanup path — turning bad input into deleted progress.
+ */
+export function rollbackPartial(partPath: string, keepBytes: number): boolean {
+  // Reject bad input BEFORE any destructive step, and without cleanup: the
+  // partial is not known to be unsafe, the argument is.
+  if (!Number.isInteger(keepBytes) || keepBytes < 0) return false;
+
+  let fd: number | undefined;
+  try {
+    fd = openSync(partPath, "r+");
+    const stat = fstatSync(fd);
+    // Only a regular file is ours to truncate; a symlink or device is not.
+    if (!stat.isFile()) return false;
+    if (stat.size <= keepBytes) return true;
+
+    ftruncateSync(fd, keepBytes);
+    if (fstatSync(fd).size === keepBytes) return true;
+  } catch {
+    // Fall through: the partial is not known-safe, so it is neutralised below.
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* nothing useful to do */
+      }
+    }
+  }
+
+  return neutralisePartial(partPath);
+}
+
+/**
+ * Delete a partial that cannot be vouched for, and report that it is unsafe.
+ *
+ * Always returns false. Deletion is the only cleanup worth attempting: an
+ * earlier version also tried emptying the file, but that fallback cannot fire —
+ * any filesystem state permitting `truncate(path, 0)` also permits the
+ * `ftruncateSync` above, which would have succeeded and returned already.
+ *
+ * When deletion is denied too, the redirect body stays on disk and NOTHING here
+ * can change that. The return value is then the entire mitigation: the runner
+ * records it in the status so a consumer refuses to resume this path, because
+ * `curl -C -` would otherwise append the real recording after the HTML.
+ */
+function neutralisePartial(partPath: string): boolean {
+  try {
+    unlinkSync(partPath);
+  } catch {
+    // Denied. The caller's `false` and the status it writes are what protect
+    // the next attempt now.
+  }
+  return false;
 }

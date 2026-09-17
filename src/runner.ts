@@ -21,14 +21,13 @@ import {
   readFileSync,
   renameSync,
   statSync,
-  truncateSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
 
 import { buildCurlConfig, classifyCurlFailure, parseCurlMeter, parseWriteOut } from "./curl";
-import { writeSecretFile } from "./paths";
+import { rollbackPartial, writeSecretFile } from "./paths";
 import { isTerminal, processStartTimeMs, writeStatus, type DownloadStatus } from "./status";
 
 interface RunnerPayload {
@@ -316,14 +315,31 @@ function main(): void {
       // response in particular means the partial is still valid. Only the bytes
       // THIS attempt appended are garbage.
       const redirectStub = error.httpStatus !== undefined && error.httpStatus >= 300 && error.httpStatus < 400;
-      if (redirectStub && existingBytes > 0) truncatePart(payload.partPath, existingBytes);
+
+      // `rolledBack` is READ, not discarded. When the partial could not be made
+      // safe — deletion denied AND emptying denied — the redirect body is still
+      // on disk, and the next attempt would compute `existingBytes` from that
+      // longer file and `curl -C -` the real recording onto the end of it. That
+      // is precisely the corruption this branch exists to prevent, so it has to
+      // reach the status: a consumer cannot see a cleanup failure any other way.
+      let unsafePartial = false;
+      if (redirectStub && existingBytes > 0) unsafePartial = !rollbackPartial(payload.partPath, existingBytes);
       else if (redirectStub) discardPart(payload.partPath);
       else discardEmptyPart(payload.partPath);
+
       const cancelled = error.code === "cancelled";
+      const message = unsafePartial
+        ? `${error.message} The partial file could not be cleaned up and must not be resumed; delete it before retrying.`
+        : error.message;
       persist({
         state: cancelled ? "cancelled" : "failed",
         finishedAt: Date.now(),
-        error: { code: error.code, message: error.message, httpStatus: error.httpStatus },
+        // Conditional spread, NOT `unsafePartial ? 0 : undefined`: persist does
+        // `{ ...status, ...next }`, so an explicit undefined would overwrite a
+        // real byte count — and readStatusFile rejects a status whose
+        // bytesDownloaded is not finite, making the whole file unreadable.
+        ...(unsafePartial ? { bytesDownloaded: 0 } : {}),
+        error: { code: error.code, message, httpStatus: error.httpStatus },
       });
       // Cancellation is deliberately silent: the user performed it, so telling
       // them it happened is noise. A genuine failure is the opposite — with the
@@ -487,14 +503,6 @@ function notify(payload: RunnerPayload, subtitle: string, message: string): void
  * safe to discard.
  */
 /** Roll a `.part` file back to the byte count it held before this attempt. */
-function truncatePart(partPath: string, bytes: number): void {
-  try {
-    truncateSync(partPath, bytes);
-  } catch {
-    // Best effort: the worst case is a partial that a later resume rejects.
-  }
-}
-
 /** Remove a `.part` file outright, whatever it holds. */
 function discardPart(partPath: string): void {
   try {

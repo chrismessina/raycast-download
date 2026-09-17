@@ -51,6 +51,7 @@ export {
   resolveDirectory,
   uniquePath,
   releaseReservation,
+  rollbackPartial,
   sanitizeFilename,
   type ResolveDirectoryOptions,
   type UniquePathOptions,

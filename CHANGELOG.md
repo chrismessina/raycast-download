@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.1.2
+
+**A rollback that cannot be verified now discards the partial instead of trusting it.**
+
+After an unfollowed 3xx, curl has written the redirect BODY into the `.part`
+file. On a resumed transfer the bytes before it are the user's real progress, so
+the runner rolls the file back to that length rather than discarding it.
+
+That rollback swallowed its own failure, with the note "the worst case is a
+partial that a later resume rejects". That was an assumption about the consumer,
+and a false one: consumers accept any non-empty partial. So if the truncate did
+not land, the redirect HTML stayed on disk, and the next `curl -C -` appended the
+real recording after it and published a corrupt file under the user's filename —
+the same silent corruption that refusing to treat a 3xx as success exists to
+prevent, arrived at one step later.
+
+`rollbackPartial(partPath, keepBytes)` replaces it: it truncates, **verifies the
+resulting size**, and returns false if it cannot vouch for the length — discarding
+the partial in that case, so nothing can be appended to bytes we do not trust.
+Verifying matters because a truncate that throws is obvious while one that leaves
+the file longer than asked is not, and only the second corrupts the next resume.
+
+`rollbackPartial` binds every step to one open file descriptor rather than
+operating by pathname, so another attempt replacing the file mid-sequence cannot
+have its healthy partial truncated or deleted. `keepBytes` is validated before
+anything destructive runs — it is a caller-supplied number on an exported
+function, and a negative value would otherwise turn bad input into deleted
+progress.
+
+When the partial cannot be deleted either, the runner records that in the status
+(`bytesDownloaded: 0` and an explicit message) so consumers refuse to resume that
+path. Nothing on disk can be fixed in that case, so the status is the mitigation.
+
+Exported, so a consumer can use the same rollback rather than re-implementing it.
+
+**Behaviour change:** the README previously promised partial files are always
+retained. They are not, in this one case — see "Scope of the guarantee".
+
 ## 0.1.1
 
 **`followRedirects` now actually works, and an unfollowed redirect is a failure.**
