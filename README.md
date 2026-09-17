@@ -121,6 +121,21 @@ Import from the root or from a subpath (`@chrismessina/raycast-downloader/paths`
 
 **Never put a signed URL in `meta`.** It is persisted to the status file. Store an identifier you can re-resolve from instead.
 
+**Validating `outputPath` is yours.** Layer A writes to the path you hand it, and does not check that the path lands where you meant. That is deliberate — the user picks the download location, and a library that overrode it would be wrong more often than right — but it means a path you derived from anything untrusted is your problem, not the library's. A `Content-Disposition` filename, an API-supplied name, or a title pulled from a page can all contain `../` or a path separator, and a symlink in the destination directory can redirect the final rename after your own check passed.
+
+`paths` exports the two pieces for this, and the only reason they are not applied for you is that doing so would constrain legitimate destinations:
+
+```ts
+import { isContained, sanitizeFilename } from "@chrismessina/raycast-downloader/paths";
+
+const filename = sanitizeFilename(remoteName);        // strips separators and traversal runs
+const outputPath = join(downloadsDir, filename);
+// Note the order: candidate first, root second.
+if (!isContained(outputPath, downloadsDir)) throw new Error("refusing to write outside the download directory");
+```
+
+`isContained` is component-aware and resolves existing symlink ancestors, so it is doing more than a `startsWith` on the two strings.
+
 **Retry policy is yours.** Consumers differ too much to share one: `DownloadError.retryable` gives you the signal, the loop stays in your code.
 
 **`uniquePath` numbering starts where you say.** Existing extensions differ (`(1)` vs `(2)`); `startAt` preserves that, because unifying it silently renames files users already have.

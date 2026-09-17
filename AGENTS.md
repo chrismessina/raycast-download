@@ -79,7 +79,15 @@ consumes B without being forced through a URL-shaped API. Don't make B depend on
 - **No breaking API changes.** Do not remove or rename an export or change a signature;
   additive optional params only. `raycast-fathom` consumes this today.
 - **A documented security property with no mechanism is a defect, not a docs nit.** (History
-  claimed signed URLs were never persisted; nothing enforced it. Now `urlPolicy` does.)
+  claimed signed URLs were never persisted; nothing enforced it. Now `urlPolicy` does.) **The
+  mirror of that is equally a defect: a responsibility the caller really has that nothing tells
+  them about.** Layer A writes to the `outputPath` it is given and never calls `isContained` or
+  `sanitizeFilename` on it. That is deliberate — the user chooses the destination, and
+  constraining it would be wrong more often than right — so do NOT "fix" it by enforcing
+  containment. It is documented under "Notes for consumers" in `README.md` instead, with a
+  worked example. Keep it documented; if you change the behaviour, change that section first.
+  Note `isContained(candidate, root)` takes the candidate FIRST — reversing it rejects valid
+  paths rather than admitting invalid ones, so it fails loudly, but it is still wrong.
 
 ## Working style here
 
