@@ -65,6 +65,13 @@ export interface StartDownloadOptions {
   sizeCheck?: "strict" | "advisory";
   /** Continue from an existing partial file via HTTP Range. Default true. */
   resume?: boolean;
+  /**
+   * Follow HTTP redirects (curl `--location`). Default true.
+   *
+   * Turning it off is a real choice, not a no-op: an unfollowed 3xx is then a
+   * FAILURE, because the body curl writes is the redirect stub, not the file.
+   */
+  followRedirects?: boolean;
   speedLimitBytes?: number;
   stallSeconds?: number;
   /** Cap transfer rate in bytes/sec. Actually slows the download. */
@@ -186,6 +193,7 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
     headers,
     expectedBytes,
     resume = true,
+    followRedirects = true,
     speedLimitBytes,
     stallSeconds,
     limitRateBytes,
@@ -241,6 +249,7 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
       headers,
       expectedBytes,
       resume,
+      followRedirects,
       speedLimitBytes,
       stallSeconds,
       limitRateBytes,

@@ -119,6 +119,8 @@ Import from the root or from a subpath (`@chrismessina/raycast-downloader/paths`
 
 ## Notes for consumers
 
+**A 3xx is never a successful download — including with redirects on.** Success is strictly 2xx. With redirects on (the default) curl follows the hops and reports the final 2xx, so the usual redirect is invisible to you; but `--location` only follows a response carrying a usable `Location`, so a **304** (you sent a conditional header) or a **300** ends the transfer as itself. Those now fail with `http_client` rather than publishing an empty or stale file. With `followRedirects: false`, curl writes the redirect *body* to the `.part` file and exits 0 — that stub is discarded and the download fails with "The server redirected (HTTP 302) but redirects are disabled." Expose the preference if your users need it; don't expect a 302 to still produce a file.
+
 **Never put a signed URL in `meta`.** It is persisted to the status file. Store an identifier you can re-resolve from instead.
 
 **Validating `outputPath` is yours.** Layer A writes to the path you hand it, and does not check that the path lands where you meant. That is deliberate — the user picks the download location, and a library that overrode it would be wrong more often than right — but it means a path you derived from anything untrusted is your problem, not the library's. A `Content-Disposition` filename, an API-supplied name, or a title pulled from a page can all contain `../` or a path separator, and a symlink in the destination directory can redirect the final rename after your own check passed.

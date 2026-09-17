@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.1
+
+**`followRedirects` now actually works, and an unfollowed redirect is a failure.**
+
+`buildCurlConfig` accepted and honored `followRedirects`, but nothing could reach it:
+neither `StartDownloadOptions` nor the runner payload carried the field, so every
+detached download followed redirects and the documented option was dead config. It is
+now plumbed end to end (default unchanged: `true`).
+
+Making it reachable exposed the reason it mattered. The runner's success predicate
+treated any 3xx as success, so with redirects off curl wrote the redirect BODY to the
+`.part` file, exited 0, reported 302 — and the stub was renamed to the user's expected
+filename and published as a completed download.
+
+**Success is now strictly 2xx, whatever `followRedirects` says.** `--location` only
+follows a response carrying a usable `Location`, so a 304 (the caller sent a conditional
+header) or a 300 is still the final status with redirects fully enabled — and a 304
+writes no body at all, which on a resumed transfer would have published the existing
+partial as if it were whole. When a transfer genuinely succeeds behind redirects, curl
+reports the 2xx of the final hop, so nothing legitimate is rejected.
+
+`classifyCurlFailure` gained a 3xx branch (`http_client`, non-retryable), worded for the
+case at hand — unchanged (304), redirects disabled, or a redirect that could not be
+followed. Previously an unfollowed redirect fell through to "Download failed (curl exit
+0)." and a 304 surfaced as an ENOENT on the rename. The branch is gated on a clean curl
+exit so a redirect loop keeps its own "Too many redirects" (exit 47).
+
+Whatever a 3xx wrote into the `.part` file is rolled back — deleted outright when the
+attempt started from nothing, truncated back to the pre-attempt byte count when it was
+resuming. A redirect body is not resumable content, and a later retry would otherwise
+have `continue-at`-ed past the HTML and spliced the real file onto it.
+
 ## 0.1.0
 
 First release.

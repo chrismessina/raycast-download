@@ -275,6 +275,8 @@ export interface ClassifyCurlInput {
   stderrTail?: string;
   /** True when the local process deliberately terminated curl. */
   cancelled?: boolean;
+  /** Whether the request was made with redirects enabled. Default true. */
+  followRedirects?: boolean;
 }
 
 /**
@@ -285,10 +287,30 @@ export interface ClassifyCurlInput {
  * "curl exited 22".
  */
 export function classifyCurlFailure(input: ClassifyCurlInput): DownloadError {
-  const { exitCode, signal, httpCode, stderrTail, cancelled } = input;
+  const { exitCode, signal, httpCode, stderrTail, cancelled, followRedirects = true } = input;
 
   if (cancelled || signal === "SIGTERM" || signal === "SIGINT") {
     return new DownloadError("cancelled", "Download cancelled.", { exitCode, signal });
+  }
+
+  // A 3xx only reaches here when redirects were DISABLED: with `location` set,
+  // curl reports the status of the final hop, never the redirect itself. curl
+  // exits 0 for an unfollowed redirect, so without this branch the code falls
+  // past EXIT_CODES[0] into the last-resort message and reports
+  // "Download failed (curl exit 0)." for a perfectly explicable outcome.
+  // Gated on a CLEAN exit: curl exits 47 ("Too many redirects") while reporting
+  // a 3xx http_code, and that is a redirect loop, not an unfollowed redirect.
+  // Letting this branch win would relabel it.
+  if (exitCode === 0 && httpCode !== undefined && httpCode >= 300 && httpCode < 400) {
+    return new DownloadError(
+      // `http_client`, not a new code: the request did not yield the body and
+      // the caller must change something (enable redirects, drop a conditional
+      // header, pass the final URL) — exactly the non-retryable bucket
+      // `http_client` names.
+      "http_client",
+      unfollowedRedirectMessage(httpCode, followRedirects),
+      { httpStatus: httpCode, exitCode, signal },
+    );
   }
 
   if (httpCode !== undefined && httpCode >= 400) {
@@ -308,6 +330,20 @@ export function classifyCurlFailure(input: ClassifyCurlInput): DownloadError {
     detail ? `Download failed: ${detail}` : `Download failed (curl exit ${exitCode ?? "unknown"}).`,
     { exitCode, signal, httpStatus: httpCode },
   );
+}
+
+/**
+ * Wording for a 3xx that curl exited 0 on.
+ *
+ * `location` does NOT guarantee the absence of a final 3xx: curl only follows a
+ * response that carries a usable `Location`. A 304 (the caller sent a
+ * conditional header) and a 300 (multiple choices, no `Location`) both end the
+ * transfer as themselves, with redirects fully enabled.
+ */
+function unfollowedRedirectMessage(status: number, followRedirects: boolean): string {
+  if (status === 304) return "The server reported the file as unchanged (HTTP 304) and sent no content.";
+  if (!followRedirects) return `The server redirected (HTTP ${status}) but redirects are disabled.`;
+  return `The server returned a redirect that could not be followed (HTTP ${status}).`;
 }
 
 function httpErrorMessage(status: number): string {

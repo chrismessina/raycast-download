@@ -15,7 +15,16 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  truncateSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
 import { buildCurlConfig, classifyCurlFailure, parseCurlMeter, parseWriteOut } from "./curl";
@@ -32,6 +41,8 @@ interface RunnerPayload {
   headers?: Record<string, string>;
   expectedBytes?: number;
   resume?: boolean;
+  /** Follow HTTP redirects. Default true. */
+  followRedirects?: boolean;
   speedLimitBytes?: number;
   stallSeconds?: number;
   limitRateBytes?: number;
@@ -145,12 +156,15 @@ function main(): void {
   const existingBytes = existsSync(payload.partPath) ? safeSize(payload.partPath) : 0;
   const resume = Boolean(payload.resume) && existingBytes > 0;
 
+  const followRedirects = payload.followRedirects ?? true;
+
   let configPath: string;
   try {
     const config = buildCurlConfig({
       url: payload.url,
       outputPath: payload.partPath,
       headers: payload.headers,
+      followRedirects,
       resume,
       speedLimitBytes: payload.speedLimitBytes,
       stallSeconds: payload.stallSeconds,
@@ -270,16 +284,41 @@ function main(): void {
 
     const writeOut = parseWriteOut(stdout);
     const httpCode = writeOut.httpCode;
-    const succeeded = exitCode === 0 && (httpCode === undefined || (httpCode >= 200 && httpCode < 400));
+    // Success is strictly 2xx. A 3xx is NEVER a downloaded file:
+    //
+    //  - redirects off: curl writes the redirect BODY to the `.part` file and
+    //    exits 0, so accepting it renames a stub to the user's expected
+    //    filename and publishes it as a completed download;
+    //  - redirects ON: `location` only follows a response carrying a usable
+    //    `Location`, so a 304 (caller sent a conditional header) or a 300 is
+    //    still the final status. A 304 writes NO body, which on a resumed
+    //    transfer would publish the existing partial as if it were whole.
+    //
+    // When redirects were followed and the transfer really succeeded, curl
+    // reports the 2xx of the final hop, so nothing legitimate is lost here.
+    const httpOk = httpCode === undefined || (httpCode >= 200 && httpCode < 300);
+    const succeeded = exitCode === 0 && httpOk;
 
     if (!succeeded) {
-      const error = classifyCurlFailure({ exitCode, signal, httpCode, stderrTail: stderr });
+      const error = classifyCurlFailure({ exitCode, signal, httpCode, stderrTail: stderr, followRedirects });
       // The .part file is retained so a retry can resume — but only when it
       // holds something to resume FROM. curl creates the file on open, so a
       // request that failed before its first byte (404, DNS, TLS) leaves a
       // 0-byte file that can never be resumed and that the user has no way to
       // account for sitting in their Downloads folder.
-      discardEmptyPart(payload.partPath);
+      // …except whatever a 3xx wrote, which is never resumable content. curl
+      // writes the redirect BODY to the `.part` file, so a later retry would
+      // `continue-at` past that HTML and splice the real file onto it — the
+      // exact silent corruption `fail` exists to prevent.
+      //
+      // Rolled back to `existingBytes` rather than deleted outright: on a
+      // resumed transfer those bytes are the user's real progress and a 304
+      // response in particular means the partial is still valid. Only the bytes
+      // THIS attempt appended are garbage.
+      const redirectStub = error.httpStatus !== undefined && error.httpStatus >= 300 && error.httpStatus < 400;
+      if (redirectStub && existingBytes > 0) truncatePart(payload.partPath, existingBytes);
+      else if (redirectStub) discardPart(payload.partPath);
+      else discardEmptyPart(payload.partPath);
       const cancelled = error.code === "cancelled";
       persist({
         state: cancelled ? "cancelled" : "failed",
@@ -447,6 +486,24 @@ function notify(payload: RunnerPayload, subtitle: string, message: string): void
  * Only the empty case — where there is provably nothing to resume from — is
  * safe to discard.
  */
+/** Roll a `.part` file back to the byte count it held before this attempt. */
+function truncatePart(partPath: string, bytes: number): void {
+  try {
+    truncateSync(partPath, bytes);
+  } catch {
+    // Best effort: the worst case is a partial that a later resume rejects.
+  }
+}
+
+/** Remove a `.part` file outright, whatever it holds. */
+function discardPart(partPath: string): void {
+  try {
+    unlinkSync(partPath);
+  } catch {
+    // Best effort.
+  }
+}
+
 function discardEmptyPart(partPath: string): void {
   try {
     if (existsSync(partPath) && statSync(partPath).size === 0) unlinkSync(partPath);

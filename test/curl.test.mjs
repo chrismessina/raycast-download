@@ -274,3 +274,22 @@ test("limit-rate is emitted only when asked, and is distinct from speed-limit", 
   assert.match(throttled, /^limit-rate = 300000$/m);
   assert.match(throttled, /^speed-limit = \d+$/m, "stall detection must remain active");
 });
+
+test("an unfollowed 3xx is classified as a redirect, but a redirect LOOP stays exit 47", () => {
+  const disabled = classifyCurlFailure({ exitCode: 0, httpCode: 302, followRedirects: false });
+  assert.equal(disabled.code, "http_client");
+  assert.match(disabled.message, /redirected \(HTTP 302\).*disabled/);
+  assert.equal(disabled.retryable, false);
+
+  // With redirects ON, a surviving 3xx is one curl could not follow.
+  const unfollowable = classifyCurlFailure({ exitCode: 0, httpCode: 300 });
+  assert.match(unfollowable.message, /could not be followed \(HTTP 300\)/);
+
+  // 304 is its own thing and gets its own words.
+  assert.match(classifyCurlFailure({ exitCode: 0, httpCode: 304 }).message, /unchanged \(HTTP 304\)/);
+
+  // curl reports a 3xx http_code alongside exit 47; that is a loop, not a
+  // disabled-redirect outcome, and must keep its own message.
+  const loop = classifyCurlFailure({ exitCode: 47, httpCode: 302 });
+  assert.match(loop.message, /Too many redirects/);
+});
