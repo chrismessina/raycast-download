@@ -104,6 +104,8 @@ The package itself logs nothing and takes no logger dependency. That is delibera
 
 **Does not survive** (without user action): machine sleep, power loss, unattended network drops. A partial file is retained so an interrupted transfer resumes via HTTP Range instead of starting over.
 
+**Resume is not automatic on a byte count.** A `.part` file is resumed only when the package can identify it as its own AND the server gave it something to check: the URL it came from and the `ETag`/`Last-Modified` that describe the bytes are recorded beside the file as it downloads, and the validator is sent back as `If-Range`. A partial with no record — one written by an older version, or a file that happens to occupy the path — is reset and the download restarts, and so is one whose server sent no validator at all. A re-signed URL still resumes: identity ignores the query string, which is what makes the documented "request a fresh link and continue" recovery work. `curl -C -` asserts that the bytes on disk are a correct prefix of what it is fetching, and nothing downstream can check that assertion: measured against a Range-capable server, an 8-byte wrong prefix completes with exit 0, HTTP 206, and a published file that is silently spliced.
+
 **One exception, and it is deliberate:** a partial is discarded when it cannot be proven safe to resume from. An unfollowed 3xx leaves the redirect body in the `.part` file; that tail is rolled back, and if the rollback cannot be verified the partial is deleted rather than kept. `curl -C -` appends from the file's current size, so resuming onto unverified bytes would splice the real file after redirect HTML and publish it under the user's filename. Progress is recoverable; a corrupt file is not. If the partial cannot be deleted either, the status records the failure and consumers must not resume that path.
 
 This is stated narrowly on purpose. Detached spawn solves parent-process-exit — the problem Raycast creates. It is not a download supervisor.
@@ -190,7 +192,21 @@ Import from the root or from a subpath (`@chrismessina/raycast-downloader/paths`
 
 ## Notes for consumers
 
-**Check `partialUnsafe` before you resume.** A failed download normally leaves its `.part` file in place precisely so a retry can resume from it. `partialUnsafe: true` on the status is the exception: the runner put something in that file that does not belong to the download and could not take it back out, so resuming would splice the real file onto it. Delete or replace the partial before the next attempt. The flag is absent on every ordinary status — including failures whose partial is perfectly resumable — and absence means "nothing was recorded", not "verified safe": a runner older than 0.1.3 cannot set it. Do not read `bytesDownloaded: 0` as the same signal; an empty response and a failed setup report zero too.
+**`Range` and `If-Range` are not yours to set.** Passing either in `headers` throws `DownloadError` with `code: "validation"`. The downloader generates both, caller headers are appended after the generated ones, and a duplicate is what a server or proxy may act on — which turns the resume guard off silently.
+
+**One destination, one live download.** `startDownload` claims the destination before it spawns anything, and a second attempt against a path a live attempt already holds is refused with `code: "conflict"` rather than queued or silently renamed. Two downloads sharing an `outputPath` append to each other's bytes — exit 0, HTTP 206, published. If you need a free name instead of a refusal, `uniquePath` allocates one:
+
+```ts
+import { uniquePath } from "@chrismessina/raycast-downloader/paths";
+
+const outputPath = uniquePath(downloadsDir, filename, { reserve: true });
+```
+
+A claim whose owner is provably dead is stolen, so a runner killed mid-transfer does not wedge the filename.
+
+**Three sidecar files may exist next to a `.part` while a download is live** — `.state`, `.claim` and `.headers`. They hold the provenance that makes a resume safe, the live-attempt claim, and curl's header dump. All are removed when the download completes. If you enumerate the destination directory to show the user what is in flight, filter them out.
+
+**Check `partialUnsafe` before you resume.** A failed download normally leaves its `.part` file in place precisely so a retry can resume from it. `partialUnsafe: true` on the status is the exception: the runner put something in that file that does not belong to the download and could not take it back out. **The package enforces this itself** — the same fact is recorded beside the file, and a later attempt resets the partial or fails rather than resuming onto it — so the flag is there for what you show the user, not for a rule you have to implement. The flag is absent on every ordinary status — including failures whose partial is perfectly resumable — and absence means "nothing was recorded", not "verified safe": a runner older than 0.1.3 cannot set it. Do not read `bytesDownloaded: 0` as the same signal; an empty response and a failed setup report zero too.
 
 **A 3xx is never a successful download — including with redirects on.** Success is strictly 2xx. With redirects on (the default) curl follows the hops and reports the final 2xx, so the usual redirect is invisible to you; but `--location` only follows a response carrying a usable `Location`, so a **304** (you sent a conditional header) or a **300** ends the transfer as itself. Those now fail with `http_client` rather than publishing an empty or stale file. With `followRedirects: false`, curl writes the redirect *body* to the `.part` file and exits 0 — that stub is discarded and the download fails with "The server redirected (HTTP 302) but redirects are disabled." Expose the preference if your users need it; don't expect a 302 to still produce a file.
 

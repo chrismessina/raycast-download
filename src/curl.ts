@@ -76,6 +76,26 @@ export interface CurlConfigOptions {
    * see the note above about sleep.
    */
   maxTimeSeconds?: number;
+  /**
+   * Write the response headers to this path (`--dump-header`).
+   *
+   * The point is the NEXT attempt, not this one: a resumed transfer has to
+   * prove the bytes on disk still belong to the resource it is about to append
+   * to, and `ETag`/`Last-Modified` are the only proof a server offers. They are
+   * dumped even for an interrupted transfer, because that is precisely the
+   * transfer whose partial gets resumed.
+   */
+  dumpHeaderPath?: string;
+  /**
+   * `If-Range` validator for a resumed transfer.
+   *
+   * Turns a silent splice into a clean refusal. Measured against a
+   * Range-capable local server: with a stale validator the server answers 200
+   * with the whole body, and curl exits 33 leaving the partial untouched —
+   * where the same request WITHOUT `If-Range` gets a 206 and appends the new
+   * resource's bytes to the old resource's prefix, exit 0, published.
+   */
+  ifRange?: string;
 }
 
 /**
@@ -96,6 +116,8 @@ export function buildCurlConfig(options: CurlConfigOptions): string {
     connectTimeoutSeconds = 30,
     limitRateBytes,
     maxTimeSeconds,
+    dumpHeaderPath,
+    ifRange,
   } = options;
 
   const lines: string[] = [
@@ -124,13 +146,45 @@ export function buildCurlConfig(options: CurlConfigOptions): string {
   // `-C -` asks curl to work out the offset from the existing file.
   if (resume) lines.push("continue-at = -");
   if (limitRateBytes !== undefined) lines.push(`limit-rate = ${limitRateBytes}`);
+  if (dumpHeaderPath) lines.push(`dump-header = "${escapeConfigValue(dumpHeaderPath)}"`);
+  // Only meaningful alongside `continue-at`, which is what generates the Range
+  // this validates. Harmless without one: a server ignores `If-Range` on an
+  // unranged request.
+  if (ifRange) lines.push(`header = "${escapeConfigValue(`If-Range: ${ifRange}`)}"`);
   if (maxTimeSeconds !== undefined) lines.push(`max-time = ${maxTimeSeconds}`);
 
+  assertCallerHeaders(headers);
   for (const [name, value] of Object.entries(headers)) {
     lines.push(`header = "${escapeConfigValue(`${name}: ${value}`)}"`);
   }
 
   return lines.join("\n") + "\n";
+}
+
+/**
+ * Refuse caller headers that would fight the resume machinery.
+ *
+ * `Range` and `If-Range` belong to the transport. Caller headers are appended
+ * AFTER the generated ones, so a second `If-Range` — or a hand-written `Range`
+ * — is what a server or proxy may act on, and the resume guard silently stops
+ * guarding: a 206 comes back for bytes that do not continue the partial, curl
+ * exits 0, and the spliced file is published.
+ *
+ * Refused rather than dropped, because a caller who passed one meant something
+ * by it and deserves to be told it cannot work. Exported so `startDownload` can
+ * fail before it claims a path or spawns anything, rather than minutes later
+ * inside a detached process.
+ */
+export function assertCallerHeaders(headers: Record<string, string> = {}): void {
+  for (const name of Object.keys(headers)) {
+    if (/^(range|if-range)$/i.test(name.trim())) {
+      throw new DownloadError(
+        "validation",
+        `The ${name.trim()} header is managed by the downloader and cannot be set by a caller. ` +
+          `Use the resume option instead.`,
+      );
+    }
+  }
 }
 
 /**

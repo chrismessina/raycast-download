@@ -25,8 +25,15 @@ import { randomUUID } from "node:crypto";
 import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
-import { hasCurl } from "./curl";
+import { assertCallerHeaders, hasCurl } from "./curl";
 import { DownloadError } from "./errors";
+import {
+  claimPartialPath,
+  markPartialUnsafe,
+  partialClaimHolder,
+  releasePartialClaim,
+  updatePartialClaim,
+} from "./partial";
 import { writeSecretFile } from "./paths";
 import {
   assertSafeId,
@@ -209,6 +216,11 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
   // path is built from it.
   assertSafeId(id);
 
+  // Before anything is claimed or spawned: a header that would defeat the
+  // resume guard is a caller mistake, and a detached process reporting it
+  // minutes later is a worse way to learn about it.
+  assertCallerHeaders(headers);
+
   const filename = options.filename ?? outputPath.split("/").pop() ?? "download";
   const partPath = `${outputPath}.part`;
   const runner = runnerOverride ?? runnerPath();
@@ -226,9 +238,43 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
     );
   }
 
+  // Claim the PATH before anything is written to it, and before the runner that
+  // will write to it is spawned.
+  //
+  // Ids do not protect a file. Two downloads with different ids can name one
+  // `outputPath`, and the second one's `curl -C -` appends to the first one's
+  // bytes — exit 0, HTTP 206, published. Leases and status locks are both
+  // id-scoped, so neither of them sees this at all.
+  //
+  // Refused rather than serialized or renamed: a queued download looks hung,
+  // and silently writing to a different filename than the caller asked for is
+  // exactly the override this package refuses to do elsewhere. A caller that
+  // wants a free name can get one from `uniquePath`.
+  const claimToken = claimPartialPath(partPath, {
+    pid: process.pid,
+    startedAtMs: processStartTimeMs(process.pid) ?? Date.now(),
+    id,
+  });
+  if (!claimToken) {
+    const holder = partialClaimHolder(partPath);
+    throw new DownloadError(
+      "conflict",
+      `Another download is already writing to ${outputPath}` +
+        `${holder ? ` (process ${holder.pid}, download ${holder.id})` : ""}. ` +
+        `Wait for it to finish, or choose a different destination.`,
+    );
+  }
+
+  // A partial that a PREVIOUS version marked unsafe recorded it in its status
+  // and nowhere else. Carry that forward to the file itself, so the runner —
+  // which reads the path, not the id — refuses to resume onto it. Id-addressed,
+  // not a scan: this is the status for the id the caller handed us.
+  if (readStatus(id, statusDir)?.partialUnsafe) markPartialUnsafe(partPath);
+
   // Fail here rather than minutes later inside the runner: a missing binary is a
   // prerequisite the user can fix, not a transport error.
   if (!hasCurl()) {
+    releasePartialClaim(partPath, claimToken);
     throw new DownloadError(
       "validation",
       "curl is required to download files but was not found on this system.",
@@ -238,27 +284,34 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
   // The payload carries the URL, so it goes in a 0600 file rather than argv,
   // which `ps` exposes to every process on the machine. The runner unlinks it.
   const payloadPath = join(statusDir, `${id}.payload.json`);
-  writeSecretFile(
-    payloadPath,
-    JSON.stringify({
-      id,
-      url,
-      outputPath,
-      partPath,
-      filename,
-      statusDir,
-      headers,
-      expectedBytes,
-      resume,
-      followRedirects,
-      speedLimitBytes,
-      stallSeconds,
-      limitRateBytes,
-      sizeCheck,
-      meta,
-      notifyOnFinish,
-    }),
-  );
+  try {
+    writeSecretFile(
+      payloadPath,
+      JSON.stringify({
+        id,
+        url,
+        outputPath,
+        partPath,
+        filename,
+        statusDir,
+        headers,
+        expectedBytes,
+        resume,
+        followRedirects,
+        speedLimitBytes,
+        stallSeconds,
+        limitRateBytes,
+        sizeCheck,
+        claimToken,
+        meta,
+        notifyOnFinish,
+      }),
+    );
+  } catch (error) {
+    // Nothing has been spawned, so this claim belongs to nobody.
+    releasePartialClaim(partPath, claimToken);
+    throw error;
+  }
 
   const child = spawn(process.execPath, [runner, payloadPath], {
     // POSIX: makes the child a process-group leader so `kill(-pid)` reaches
@@ -317,6 +370,11 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
   let spawnFailed = false;
   child.on("error", (error: Error) => {
     spawnFailed = true;
+    // The runner never ran, so nothing else will ever release this path. By
+    // token, because this handler fires AFTER `startDownload` threw: the caller
+    // may already have retried and taken a new claim, and releasing that one
+    // would hand the path to a third attempt mid-transfer.
+    releasePartialClaim(partPath, claimToken);
     try {
       unlinkSync(payloadPath);
     } catch {
@@ -343,6 +401,7 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
 
   const pid = child.pid;
   if (pid === undefined) {
+    releasePartialClaim(partPath, claimToken);
     try {
       unlinkSync(payloadPath);
     } catch {
@@ -350,6 +409,12 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
     }
     throw new DownloadError("unknown", "Could not start the download process.");
   }
+
+  // Hand the claim to the process that will actually hold it. Taken under this
+  // command's identity because the claim has to exist BEFORE the spawn, but
+  // this command exits in seconds and the runner runs for minutes — a claim
+  // pointing at a dead parent reads as abandoned while the download is live.
+  updatePartialClaim(partPath, { pid, startedAtMs: processStartTimeMs(pid) ?? Date.now(), id, token: claimToken });
 
   // Wait briefly for THIS attempt's first status write, so callers can watch a
   // file that already exists rather than racing it.
@@ -429,6 +494,12 @@ export async function killDownload(
     if (!isTerminal(status.state)) {
       writeStatus({ ...status, state: "cancelled", finishedAt: Date.now() }, statusDir);
     }
+    // And release the path it was holding. A runner that died without running
+    // its signal handler — SIGKILL, or `taskkill /T`, which delivers nothing
+    // catchable — leaves its claim behind, and the next attempt would have to
+    // wait for the staleness check to find a dead owner. `force`, because the
+    // holder is provably gone and this process never had its token.
+    releasePartialClaim(status.partPath, undefined, true);
     return false;
   }
 
@@ -495,6 +566,9 @@ export async function killDownload(
     !isAlive(settled)
   ) {
     writeStatus({ ...settled, state: "cancelled", finishedAt: Date.now() }, statusDir);
+    // Same reasoning as above: this is the Windows path, where the runner is
+    // terminated without ever reaching its own cleanup.
+    releasePartialClaim(status.partPath, undefined, true);
   }
 
   return true;

@@ -27,6 +27,14 @@ export type DownloadErrorCode =
   /** Caller-supplied input was rejected before any request was made. */
   | "validation"
   /**
+   * Another live attempt already owns this `outputPath`.
+   *
+   * Not retryable on its own: the other attempt has to finish, or this caller
+   * has to pick a different path (`uniquePath` allocates one). Retrying the
+   * same path in a loop just races the same holder again.
+   */
+  | "conflict"
+  /**
    * The transfer began and then stopped without recording an outcome, leaving a
    * partial file behind. Distinct from `runner_failed` in the one way that
    * matters to the user: there are bytes on disk, so resuming is worthwhile.

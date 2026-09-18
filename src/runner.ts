@@ -28,6 +28,19 @@ import { dirname } from "node:path";
 
 import { buildCurlConfig, classifyCurlFailure, parseCurlMeter, parseWriteOut } from "./curl";
 import { rollbackPartial, writeSecretFile } from "./paths";
+import {
+  clearPartialState,
+  headerPath,
+  markPartialUnsafe,
+  mayResume,
+  parseValidators,
+  readPartialState,
+  releasePartialClaim,
+  resetPartial,
+  resourceFingerprint,
+  urlFingerprint,
+  writePartialState,
+} from "./partial";
 import { isTerminal, processStartTimeMs, writeStatus, type DownloadStatus } from "./status";
 
 interface RunnerPayload {
@@ -46,6 +59,14 @@ interface RunnerPayload {
   stallSeconds?: number;
   limitRateBytes?: number;
   sizeCheck?: "strict" | "advisory";
+  /**
+   * Proof that this runner owns the claim on `partPath`.
+   *
+   * Inherited from the command that spawned it. Releasing by pathname alone
+   * would let a late cleanup here delete a claim a LATER attempt has since
+   * taken, so the token travels with the work it authorises.
+   */
+  claimToken?: string;
   meta?: Record<string, unknown>;
   /**
    * Post a desktop notification on completion or failure.
@@ -130,11 +151,61 @@ function main(): void {
 
   persist({});
 
+  /**
+   * Record what the bytes currently in the `.part` file are, so the NEXT
+   * attempt can decide whether it may append to them.
+   *
+   * Called on every path that leaves a partial behind — failure and
+   * cancellation alike — because a cancelled transfer is the one users resume
+   * most. Without this the next attempt sees only a byte count, which is not
+   * evidence of anything.
+   */
+  const recordPartialForResume = (): void => {
+    const validators = readValidators(payload.partPath);
+    const existing = readPartialState(payload.partPath);
+    writePartialState(payload.partPath, {
+      v: 1,
+      ...(existing?.unsafe ? { unsafe: true as const } : {}),
+      urlHash,
+      resourceHash: resourceFingerprint(payload.url),
+      // Validators from THIS response describe the bytes this attempt wrote;
+      // keep the previous ones when the server sent none rather than dropping
+      // the only proof the partial has.
+      ...(validators.etag ?? existing?.etag ? { etag: validators.etag ?? existing?.etag } : {}),
+      ...(validators.lastModified ?? existing?.lastModified
+        ? { lastModified: validators.lastModified ?? existing?.lastModified }
+        : {}),
+    });
+  };
+
+  /** Every transient file this attempt owns, gone. The claim goes with them. */
+  const releasePath = (): void => {
+    discardHeaderDump(payload.partPath);
+    releasePartialClaim(payload.partPath, payload.claimToken);
+  };
+
+  /**
+   * The partial holds bytes that must never be appended to, and this runner
+   * could not remove them. The durable marker is what stops the next attempt;
+   * the status field is how a consumer finds out.
+   */
+  const failUnsafePartial = (message: string): void => {
+    markPartialUnsafe(payload.partPath);
+    releasePath();
+    persist({
+      state: "failed",
+      finishedAt: Date.now(),
+      partialUnsafe: true,
+      error: { code: "integrity", message },
+    });
+  };
+
   const failSetup = (code: "validation" | "permission", error: unknown): void => {
     // `uniquePath(..., { reserve: true })` creates this empty `.part` before
     // launching us. No transfer has begun on setup failure, so retaining it
     // cannot help resume and instead burns the original filename forever.
     discardEmptyPart(payload.partPath);
+    releasePath();
     persist({
       state: "failed",
       finishedAt: Date.now(),
@@ -150,10 +221,60 @@ function main(): void {
     return;
   }
 
-  // Resume only when there is something to resume from; `-C -` against a
-  // zero-byte or absent file makes curl error rather than start cleanly.
-  const existingBytes = existsSync(payload.partPath) ? safeSize(payload.partPath) : 0;
+  // What is already on disk, and what is KNOWN about it.
+  //
+  // A byte offset is not a licence to append. curl cannot check the prefix — a
+  // range request asserts it is already correct — so a partial whose provenance
+  // we cannot establish is reset rather than resumed. Measured against a
+  // Range-capable server: an 8-byte garbage prefix resumes to exit 0, HTTP 206,
+  // and a published file reading `XXXXXXXX89ABCDEFGHIJ`.
+  let existingBytes = existsSync(payload.partPath) ? safeSize(payload.partPath) : 0;
+  const partialState = readPartialState(payload.partPath);
+  const urlHash = urlFingerprint(payload.url);
+
+  if (existingBytes > 0 && partialState?.unsafe) {
+    // A previous attempt spoiled these bytes and said so. Start over — but only
+    // once the spoiled bytes are provably gone, because failing to remove them
+    // and downloading anyway is the corruption this marker exists to prevent.
+    if (!resetPartial(payload.partPath)) {
+      failUnsafePartial(
+        `The partial file for ${payload.filename} holds data from a failed attempt and could not be cleared. Delete ${payload.partPath} and try again.`,
+      );
+      process.exit(1);
+      return;
+    }
+    existingBytes = 0;
+  } else if (existingBytes > 0 && !mayResume(partialState, payload.url)) {
+    // These bytes were not put here by this download.
+    //
+    // Either they carry another URL's fingerprint, or they carry none at all —
+    // a partial from before this package recorded provenance, or a file that
+    // simply happens to sit at this path. Both are the same question, and the
+    // honest answer to "is this a correct prefix of what I am about to fetch?"
+    // is "unknown". A range request asserts that it IS correct, so an unknown
+    // prefix may not be resumed onto: the splice is invisible to curl, to the
+    // server, and to every size check downstream.
+    //
+    // The cost is one re-download, once, for a partial this version did not
+    // write. Provenance is recorded as soon as the response headers land, so a
+    // runner that is SIGKILLed mid-transfer still leaves a resumable partial —
+    // the sleep-and-resume case the package exists for is unaffected.
+    if (!resetPartial(payload.partPath)) {
+      failUnsafePartial(
+        `The partial file for ${payload.filename} cannot be identified as part of this download, and could not be cleared. Delete ${payload.partPath} and try again.`,
+      );
+      process.exit(1);
+      return;
+    }
+    existingBytes = 0;
+  }
+
   const resume = Boolean(payload.resume) && existingBytes > 0;
+
+  // `If-Range` only where the validator describes the bytes we are appending
+  // to. With a strong ETag, a changed resource comes back 200 and curl refuses
+  // (exit 33) instead of splicing; `Last-Modified` is the documented fallback.
+  const ifRange = resume ? (partialState?.etag ?? partialState?.lastModified) : undefined;
 
   const followRedirects = payload.followRedirects ?? true;
 
@@ -168,6 +289,8 @@ function main(): void {
       speedLimitBytes: payload.speedLimitBytes,
       stallSeconds: payload.stallSeconds,
       limitRateBytes: payload.limitRateBytes,
+      dumpHeaderPath: headerPath(payload.partPath),
+      ifRange,
     });
     configPath = `${payload.partPath}.curlrc`;
     writeSecretFile(configPath, config);
@@ -206,6 +329,7 @@ function main(): void {
 
   let stdout = "";
   let stderr = "";
+  let provenanceRecorded = false;
   let lastBytes = existingBytes;
   let lastByteAt = Date.now();
 
@@ -221,6 +345,15 @@ function main(): void {
 
     const progress = parseCurlMeter(stderr);
     if (!progress) return;
+
+    // A meter line means the response arrived, so curl has dumped its headers.
+    // Recorded HERE rather than at exit because the transfers that most need a
+    // resumable partial are the ones with no exit at all: a SIGKILLed runner, a
+    // machine that slept and never woke the process. Written once.
+    if (!provenanceRecorded) {
+      provenanceRecorded = true;
+      recordPartialForResume();
+    }
 
     // curl reports bytes for THIS invocation; a resumed transfer starts at 0.
     const absolute = resume ? existingBytes + progress.bytesDownloaded : progress.bytesDownloaded;
@@ -248,7 +381,10 @@ function main(): void {
   const finishCancelled = (): void => {
     clearInterval(heartbeat);
     removeConfig();
-    // Keep the .part file: cancellation should still allow a later resume.
+    // Keep the .part file: cancellation should still allow a later resume — and
+    // record what those bytes are, which is what MAKES the later resume safe.
+    recordPartialForResume();
+    releasePath();
     persist({ state: "cancelled", finishedAt: Date.now() });
     process.exit(0);
   };
@@ -267,6 +403,7 @@ function main(): void {
     clearInterval(heartbeat);
     removeConfig();
     discardEmptyPart(payload.partPath);
+    releasePath();
     persist({
       state: "failed",
       finishedAt: Date.now(),
@@ -316,6 +453,27 @@ function main(): void {
       // THIS attempt appended are garbage.
       const redirectStub = error.httpStatus !== undefined && error.httpStatus >= 300 && error.httpStatus < 400;
 
+      // curl REFUSING to resume: it asked for a range and got a whole body.
+      // Measured — that happens both when the server has no Range support and
+      // when `If-Range` says the resource changed underneath us, and curl
+      // leaves the partial untouched either way. Those bytes can never complete
+      // this download, and every retry resumes onto them again, so the file is
+      // reset here instead of being retained as if it were progress.
+      // Scoped to a 2xx answer, NOT every exit 33. curl reports 33 for any
+      // non-206 response to a ranged request, including a 304 — and a 304 says
+      // the partial is STILL VALID, so resetting there would destroy real
+      // progress to fix a conditional header the caller chose to send.
+      const rangeRefused = exitCode === 33 && httpCode !== undefined && httpCode >= 200 && httpCode < 300;
+      if (rangeRefused) {
+        if (!resetPartial(payload.partPath)) {
+          failUnsafePartial(
+            `The partial file for ${payload.filename} cannot be resumed and could not be cleared. Delete ${payload.partPath} and try again.`,
+          );
+          process.exit(1);
+          return;
+        }
+      }
+
       // `rolledBack` is READ, not discarded. When the partial could not be made
       // safe — deletion denied AND emptying denied — the redirect body is still
       // on disk, and the next attempt would compute `existingBytes` from that
@@ -332,6 +490,14 @@ function main(): void {
       // appends the real download to it. Same corruption, same flag.
       else if (redirectStub) unsafePartial = !discardPart(payload.partPath);
       else discardEmptyPart(payload.partPath);
+
+      // The marker goes on DISK, beside the file it describes. The status field
+      // says the same thing, but a status is addressed by id — and a retry with
+      // a new id, which is the normal case, never reads it. The one thing that
+      // must not happen is the next attempt appending to these bytes.
+      if (unsafePartial) markPartialUnsafe(payload.partPath);
+      else recordPartialForResume();
+      releasePath();
 
       const cancelled = error.code === "cancelled";
       const message = unsafePartial
@@ -380,6 +546,9 @@ function main(): void {
           message: `Incomplete download: expected ${expected} bytes, got ${finalBytes}.`,
         },
       });
+      // Genuine bytes, just not all of them — resumable, so record what they are.
+      recordPartialForResume();
+      releasePath();
       process.exit(1);
       return;
     }
@@ -393,6 +562,7 @@ function main(): void {
         bytesDownloaded: 0,
         error: { code: "integrity", message: "The server returned an empty file." },
       });
+      releasePath();
       process.exit(1);
       return;
     }
@@ -410,6 +580,11 @@ function main(): void {
     try {
       renameSync(payload.partPath, payload.outputPath);
     } catch (error) {
+      // The rename failed, so the bytes are still in the `.part` file — and they
+      // are a complete, correct copy. Record them: this is the one failure
+      // where the partial is not partial.
+      recordPartialForResume();
+      releasePath();
       persist({
         state: "failed",
         finishedAt: Date.now(),
@@ -419,12 +594,35 @@ function main(): void {
       return;
     }
 
+    // The partial became the finished file, so everything recorded about it
+    // describes a path that no longer holds bytes. Cleared AFTER the rename:
+    // until that lands, the state is still the truth about what is on disk.
+    clearPartialState(payload.partPath);
+    releasePath();
+
     persist({ state: "completed", finishedAt: Date.now(), bytesDownloaded: finalBytes, speedBytesPerSec: undefined, etaSeconds: undefined });
     // After the status write: a watching window should update immediately, and
     // a notification that hangs must not delay it.
     notify(payload, "Download Complete", payload.filename);
     process.exit(0);
   });
+}
+
+/** Read the validators curl dumped, if it got as far as response headers. */
+function readValidators(partPath: string): { etag?: string; lastModified?: string } {
+  try {
+    return parseValidators(readFileSync(headerPath(partPath), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function discardHeaderDump(partPath: string): void {
+  try {
+    unlinkSync(headerPath(partPath));
+  } catch {
+    // Never written, or already gone.
+  }
 }
 
 function safeSize(path: string): number {

@@ -23,6 +23,7 @@ import { startDownload, runnerPath } from "../dist/detach.js";
 import { readStatus, isTerminal } from "../dist/status.js";
 import { DownloadError } from "../dist/errors.js";
 import { buildCurlConfig } from "../dist/curl.js";
+import { urlFingerprint, writePartialState } from "../dist/partial.js";
 
 const FINAL_BODY = "REAL-PAYLOAD-BYTES";
 const REDIRECT_BODY = "<html>moved</html>";
@@ -191,7 +192,17 @@ test("a 304 against a resumed transfer fails and leaves the resumable bytes inta
     await withServer(async (base) => {
       const outputPath = join(dir, "out.bin");
       // Real progress from an earlier attempt, which a 304 says is still valid.
+      // Recorded provenance included: an unidentifiable partial is reset before
+      // it can be resumed onto, so without this the test would be exercising
+      // that rule rather than the 304 behaviour it is about.
       writeFileSync(`${outputPath}.part`, "EXISTING");
+      writePartialState(`${outputPath}.part`, {
+        v: 1,
+        urlHash: urlFingerprint(`${base}/not-modified`),
+        // A validator is required for any resume — without one the partial is
+        // reset before the 304 this test is about can even be reached.
+        etag: '"v1"',
+      });
 
       const ticket = await startDownload({
         url: `${base}/not-modified`,

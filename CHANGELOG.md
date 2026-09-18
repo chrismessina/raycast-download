@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.1.4
+
+**A resume now requires provenance, not just a byte count.**
+
+`curl -C -` asks a server to continue from an offset. That request asserts the bytes
+already on disk are a correct prefix of what is being fetched — an assertion nothing
+downstream can check. Measured against a Range-capable local server: an 8-byte garbage
+prefix resumes to exit 0, HTTP 206, and a published file reading `XXXXXXXX89ABCDEFGHIJ`
+where the canonical body is `0123456789ABCDEFGHIJ`. Neither curl, nor the server, nor a
+size check can see it, because every one of them is satisfied.
+
+So what is known about a `.part` file is now recorded beside it, keyed by PATH rather
+than by download id. Ids cannot protect a file: several can name one `outputPath`, a
+retry routinely uses a new one, and a consumer can point an unrelated download at a path
+another one left bytes in.
+
+- `<partPath>.state` is durable. It records the URL these bytes came from (as a hash —
+  a signed URL is a bearer credential and this file sits in the user's Downloads
+  folder), the `ETag`/`Last-Modified` that describe them, and whether a previous attempt
+  spoiled them. **A partial is resumed only when its recorded identity matches AND a
+  validator was recorded** — including when the URL is byte-for-byte the same, because a
+  stable URL is not a stable resource. Everything else restarts. Provenance is written as
+  soon as the response headers arrive, so a runner that is SIGKILLed mid-transfer still
+  leaves a resumable partial.
+- A **re-signed URL still resumes**: identity is matched on origin and path with the
+  query dropped, since the documented recovery from an expired link is to request a fresh
+  one and continue. `If-Range` is what makes that weaker test safe.
+- `<partPath>.claim` is the live-attempt claim. Created by writing the content to a
+  temporary file and `link()`ing it into place, not by `open(path, "wx")` — an exclusive
+  create makes an EMPTY file and fills it a moment later, and in that window a second
+  process reads an empty claim, calls it abandoned, and takes the path while the first
+  still believes it holds it. Each claim carries a token, so a release means "release
+  mine" rather than "unlink whatever is here": a spawn `error` event fires after
+  `startDownload` has thrown, by which time the caller may have retried and taken a new
+  claim. A claim whose owner is provably dead is stolen; a damaged one is not, because
+  with atomic creation an unreadable claim is damage rather than a race.
+
+**`partialUnsafe` is now enforced, not merely reported.** 0.1.3 wrote the flag to the
+status file and nothing consumed it. A status is addressed by id, so a retry — which
+normally has a new id — never read it, and the contaminated partial was resumed onto
+anyway. The marker now lives on the file, the runner clears it only after the bytes are
+provably gone, and an attempt that cannot clear them fails instead of downloading.
+
+**A second live download targeting one `outputPath` is refused** with the new
+`conflict` error code, rather than racing the first. Refused rather than queued or
+renamed: a queued download looks hung, and silently writing to a different filename than
+the caller asked for is the override this package refuses to make elsewhere. Callers who
+want a free name can get one from `uniquePath`.
+
+**`If-Range` on every resume.** Same URL, same path, changed resource is the one splice
+no marker can catch. With the recorded validator sent, a changed resource comes back 200
+and curl refuses (exit 33) instead of appending; without it the server serves the new
+bytes from the old offset and exits 0. Weak ETags are ignored, as RFC 9110 requires.
+
+**`Range` and `If-Range` are refused as caller headers.** They are appended after the
+generated ones, so a caller-supplied duplicate is what a server or proxy may act on —
+and the resume guard then silently stops guarding. `startDownload` rejects them before
+it claims a path or spawns anything.
+
+**`killDownload` releases the claim when it records the outcome itself.** That is the
+path where the runner was terminated without reaching its own cleanup — SIGKILL, or
+`taskkill /T`, which delivers nothing catchable.
+
+**curl exit 33 against a 2xx now resets the partial.** It means the server answered a
+ranged request with a whole body, so those bytes can never complete this download —
+retained, they made every retry fail the same way forever. Scoped to a 2xx: curl also
+reports 33 for a 304, and a 304 says the partial is still valid.
+
+### Consumer obligations
+
+Nothing here is required to keep an existing caller correct — this release exists to
+take these obligations away from callers. Two behaviours changed in ways worth knowing:
+
+1. **`startDownload` can now throw `DownloadError` with `code: "conflict"`** when
+   another live attempt holds the destination. Callers that catch and surface
+   `DownloadError` already handle it; callers that switch exhaustively on
+   `DownloadErrorCode` will see a compile error, which is the intent.
+2. **A partial written by 0.1.3 or earlier will not be resumed** — it has no recorded
+   provenance, so it is reset and the download restarts. One-time, per partial.
+3. **A server that sends neither `ETag` nor `Last-Modified` can no longer be resumed.**
+   Its transfers restart instead. Both headers are near-universal on the object storage
+   that serves signed download links; a server that sends neither gives us nothing to
+   check a resume against, and an unchecked resume is the splice this release exists to
+   prevent.
+4. **Passing a `Range` or `If-Range` header now throws** `DownloadError` with
+   `code: "validation"` instead of being sent.
+5. Three sidecar files may briefly exist next to a `.part` file (`.state`, `.claim`,
+   `.headers`). They are removed on completion. A consumer that enumerates a download
+   directory should not present them to the user.
+6. **Version skew is not covered, and cannot be.** A 0.1.3 runner neither writes nor
+   honours a claim, so a 0.1.3 and a 0.1.4 attempt running at the same time against one
+   `outputPath` can still both write to it. Nothing added here can make an
+   already-published version respect a file it has never heard of. Upgrade every consumer
+   sharing a download directory.
+
 ## 0.1.3
 
 **`partialUnsafe` on `DownloadStatus`: a machine-checkable "do not resume this file".**
