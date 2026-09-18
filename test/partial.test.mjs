@@ -172,3 +172,80 @@ test("writePartialState survives a reader catching it mid-write", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A `--dump-header` file holds one block per response in the chain, and only
+// the LAST one describes the bytes on disk. Carrying a validator forward from
+// an earlier block records a validator for a response that never produced the
+// body — and the next attempt sends it as `If-Range`, the server answers 200
+// because it does not match, curl refuses to append (exit 33), and the resume
+// silently becomes a full re-download.
+const block = (status, ...headers) => [`HTTP/1.1 ${status}`, ...headers, ""].join("\r\n");
+
+test("parseValidators: a redirect's ETag does not survive a final response without one", () => {
+  const dump = block("302 Found", 'ETag: "abc"', "Location: /final") + block("200 OK", "Content-Length: 10");
+  assert.deepEqual(parseValidators(dump), {}, "the final response described no validator, so neither do we");
+});
+
+test("parseValidators: a redirect's Last-Modified does not survive either", () => {
+  const dump =
+    block("302 Found", "Last-Modified: Wed, 17 Sep 2026 12:00:00 GMT") + block("200 OK", "Content-Length: 10");
+  assert.deepEqual(parseValidators(dump), {});
+});
+
+test("parseValidators: the final block's values win over an earlier block's", () => {
+  const dump =
+    block("302 Found", 'ETag: "first"', "Last-Modified: Wed, 17 Sep 2026 12:00:00 GMT") +
+    block("200 OK", 'ETag: "final"', "Last-Modified: Thu, 18 Sep 2026 09:00:00 GMT");
+  assert.deepEqual(parseValidators(dump), {
+    etag: '"final"',
+    lastModified: "Thu, 18 Sep 2026 09:00:00 GMT",
+  });
+});
+
+test("parseValidators: a weak ETag in the final block does not fall back to an earlier strong one", () => {
+  const dump = block("302 Found", 'ETag: "strong"') + block("200 OK", 'ETag: W/"weak"');
+  const result = parseValidators(dump);
+  assert.deepEqual(result, {});
+  // Absent, not present-and-undefined: the caller distinguishes "this response
+  // carried no validator" from "no response yet", and a key holding undefined
+  // reads as the first while looking like neither.
+  assert.equal("etag" in result, false);
+});
+
+test("parseValidators: a final block keeps its own Last-Modified when its ETag is weak", () => {
+  const dump =
+    block("302 Found", 'ETag: "strong"') +
+    block("200 OK", 'ETag: W/"weak"', "Last-Modified: Thu, 18 Sep 2026 09:00:00 GMT");
+  assert.deepEqual(parseValidators(dump), { lastModified: "Thu, 18 Sep 2026 09:00:00 GMT" });
+});
+
+test("parseValidators: an HTTP/2 status line is a block boundary too", () => {
+  const dump = ["HTTP/2 302", 'etag: "abc"', "", "HTTP/2 200", "content-length: 10", ""].join("\r\n");
+  assert.deepEqual(parseValidators(dump), {});
+});
+
+test("parseValidators: a single block is unchanged", () => {
+  const dump = block("200 OK", 'ETag: "only"', "Last-Modified: Thu, 18 Sep 2026 09:00:00 GMT");
+  assert.deepEqual(parseValidators(dump), {
+    etag: '"only"',
+    lastModified: "Thu, 18 Sep 2026 09:00:00 GMT",
+  });
+});
+
+test("parseValidators: 1xx interim blocks precede the final one and do not disturb it", () => {
+  // Captured from curl 8.7.1 against a server sending 102 then 103 Early Hints.
+  // Interim responses are dumped as their own blocks BEFORE the final one, so
+  // each resets the accumulator and the final block still wins. The `Link`
+  // header is here because a folded or bracket-heavy value must not be mistaken
+  // for a status line.
+  const dump =
+    "HTTP/1.1 102 Processing\r\n\r\n" +
+    "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload; as=style\r\n\r\n" +
+    'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: "final"\r\nConnection: keep-alive\r\n\r\n';
+  assert.deepEqual(parseValidators(dump), { etag: '"final"' });
+});
+
+test("parseValidators: a validator only an interim block carried is not kept", () => {
+  const dump = 'HTTP/1.1 103 Early Hints\r\nETag: "early"\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n';
+  assert.deepEqual(parseValidators(dump), {});
+});

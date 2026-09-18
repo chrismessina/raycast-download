@@ -442,24 +442,49 @@ function claimOwnerAlive(claim: PartialClaim): boolean {
 /**
  * Pull the `If-Range` validators out of a curl header dump.
  *
+ * Returns the LAST response block's validators and nothing else. A dump holds
+ * one block per hop, and only the final one describes the bytes that reached
+ * disk — see the boundary reset below for what carrying one forward costs.
+ *
  * Only a STRONG ETag is usable: RFC 9110 forbids a weak validator in
  * `If-Range`, because two weak-equivalent representations may differ byte for
  * byte — which is exactly the difference a resumed transfer cannot survive.
  * `Last-Modified` is the documented fallback.
  */
 export function parseValidators(dump: string): { etag?: string; lastModified?: string } {
-  const result: { etag?: string; lastModified?: string } = {};
-  // A redirect chain dumps several header blocks; the last one wins, since it
-  // describes the response that actually produced the bytes.
+  let result: { etag?: string; lastModified?: string } = {};
+
   for (const line of dump.split(/\r?\n/)) {
+    // A status line starts a new response, and everything learned from the
+    // previous one is DISCARDED rather than carried forward.
+    //
+    // Per-field last-wins is not the same rule and is wrong here: a 302 that
+    // carries an `ETag` followed by a final 200 that carries none leaves the
+    // redirect's validator in place, describing bytes it has never seen. The
+    // next attempt sends it as `If-Range`, the server finds it does not match
+    // and answers 200 instead of 206, curl refuses to append (exit 33), and the
+    // partial is reset — so the resume quietly becomes a full re-download of a
+    // file that may be hundreds of megabytes.
+    if (/^HTTP\/\d(?:\.\d)?\s+\d{3}/i.test(line)) {
+      result = {};
+      continue;
+    }
+
     const etag = /^etag:\s*(.+)$/i.exec(line);
     if (etag) {
       const value = etag[1].trim();
-      result.etag = /^W\//i.test(value) ? undefined : value;
+      // A weak validator is forbidden in `If-Range`: two weak-equivalent
+      // representations may differ byte for byte, which is exactly the
+      // difference a resumed transfer cannot survive. Deleted rather than set
+      // to undefined so the key is absent, not present-and-empty.
+      if (/^W\//i.test(value)) delete result.etag;
+      else result.etag = value;
       continue;
     }
+
     const modified = /^last-modified:\s*(.+)$/i.exec(line);
     if (modified) result.lastModified = modified[1].trim();
   }
+
   return result;
 }

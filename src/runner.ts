@@ -163,18 +163,32 @@ function main(): void {
   const recordPartialForResume = (): void => {
     const validators = readValidators(payload.partPath);
     const existing = readPartialState(payload.partPath);
+
+    // Whether THIS attempt got a response at all decides whose validators apply.
+    //
+    // A header dump exists only once curl has read response headers, and from
+    // that moment the bytes this attempt is writing belong to that response —
+    // so its validators are the whole answer, including when it supplied none.
+    // Falling back to an older validator there is the same defect this release
+    // fixes in `parseValidators`, one level up: a validator recorded against
+    // bytes it never described. It is reachable through a weak `ETag`, which
+    // `parseValidators` drops by design, and the fallback would then resurrect
+    // a strong one from an unrelated earlier response and send it as
+    // `If-Range` — precisely what the server just told us not to do.
+    //
+    // NOT keyed on the file's size: curl buffers, so a transfer can be minutes
+    // into a response with a `.part` file still reporting zero bytes. Measured,
+    // and it is why the first version of this check kept the stale validator.
+    const etag = validators ? validators.etag : existing?.etag;
+    const lastModified = validators ? validators.lastModified : existing?.lastModified;
+
     writePartialState(payload.partPath, {
       v: 1,
       ...(existing?.unsafe ? { unsafe: true as const } : {}),
       urlHash,
       resourceHash: resourceFingerprint(payload.url),
-      // Validators from THIS response describe the bytes this attempt wrote;
-      // keep the previous ones when the server sent none rather than dropping
-      // the only proof the partial has.
-      ...(validators.etag ?? existing?.etag ? { etag: validators.etag ?? existing?.etag } : {}),
-      ...(validators.lastModified ?? existing?.lastModified
-        ? { lastModified: validators.lastModified ?? existing?.lastModified }
-        : {}),
+      ...(etag ? { etag } : {}),
+      ...(lastModified ? { lastModified } : {}),
     });
   };
 
@@ -300,6 +314,11 @@ function main(): void {
     process.exit(1);
     return;
   }
+
+  // A runner killed mid-transfer leaves its header dump behind, and reading it
+  // as THIS attempt's response is exactly the stale-validator bug one release
+  // over. Cleared before curl can write a new one.
+  discardHeaderDump(payload.partPath);
 
   const child = spawn("curl", ["-K", configPath], { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -608,12 +627,19 @@ function main(): void {
   });
 }
 
-/** Read the validators curl dumped, if it got as far as response headers. */
-function readValidators(partPath: string): { etag?: string; lastModified?: string } {
+/**
+ * The validators curl dumped for THIS attempt, or undefined if it never got a
+ * response.
+ *
+ * The two cases must stay distinguishable: an empty object means "this response
+ * carried no usable validator", which is an answer, while undefined means "no
+ * response yet", which is not.
+ */
+function readValidators(partPath: string): { etag?: string; lastModified?: string } | undefined {
   try {
     return parseValidators(readFileSync(headerPath(partPath), "utf8"));
   } catch {
-    return {};
+    return undefined;
   }
 }
 

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.5
+
+**A redirect's `ETag` no longer describes bytes it never served.**
+
+`parseValidators` folded every block of a `--dump-header` file into one object, updating
+each field only when that field appeared. Its own comment claimed the last block wins —
+but the rule it implemented was per-FIELD last-wins, not per-BLOCK. A 302 carrying an
+`ETag` followed by a final 200 carrying none left the redirect's validator in place,
+recorded against bytes that response never produced.
+
+The cost lands on the next attempt, not this one. The stale validator goes out as
+`If-Range`, the server finds it does not match and answers 200 instead of 206, curl
+refuses to append (exit 33), and the runner resets the partial — so 0.1.4's resume
+silently degrades to a full re-download. For the recordings this package was built for
+that is 250–650 MB re-fetched to save nothing.
+
+A status line now resets the accumulator, so only the final response's validators
+survive. `HTTP/2 200` counts as a boundary alongside `HTTP/1.1 302 Found`. A weak `ETag`
+in the final block deletes the field rather than setting it to `undefined`, so the key is
+absent rather than present-and-empty, and it no longer falls back to an earlier block's
+strong one.
+
+**The same defect, one level up.** The code that writes the state file fell back to the
+previously recorded validator whenever this response supplied none — which resurrected a
+strong `ETag` from an unrelated earlier response exactly when the current one said
+`W/"..."`, since a weak validator is dropped by design. A response's validators are now
+the whole answer once there is a response at all, and the fallback applies only when this
+attempt never got one.
+
+That test is keyed on the header dump, not on the `.part` file's size. Measured: curl
+buffers, so a transfer can be well into a response with the partial still reporting zero
+bytes — the first version of this check used the size and kept the stale validator. A
+header dump left behind by a runner that was killed mid-transfer is now cleared before
+curl can write a new one, for the same reason.
+
+**No action for consumers.** A `.state` file written by 0.1.4 may hold a redirect's
+`ETag`. It repairs itself on first use: the resume is refused, the partial is reset, and
+the next attempt records the right validator — the same one wasted download that
+invalidating those files outright would have cost, so they are left alone.
+
 ## 0.1.4
 
 **A resume now requires provenance, not just a byte count.**

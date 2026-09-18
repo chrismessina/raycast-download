@@ -21,6 +21,7 @@ import { readStatus, isTerminal } from "../dist/status.js";
 import { DownloadError } from "../dist/errors.js";
 import {
   claimPath,
+  parseValidators,
   markPartialUnsafe,
   readPartialState,
   resourceFingerprint,
@@ -434,6 +435,104 @@ test("a cancelled transfer records what its partial is, so the resume is checkab
       }
     });
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Against curl's own `--dump-header` output, which is the thing the parser has
+// to match: the unit tests prove the RULE, this proves the FORMAT — that curl
+// writes a status line per hop, spelled the way the boundary regex expects.
+// Written as a direct curl run rather than a download, because the validator
+// has to be read from the dump itself; a completed download clears its state,
+// and racing a cancellation to inspect it would test the race, not the parser.
+test("curl's real redirect dump does not leak the redirect's ETag to the final response", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "validators-"));
+  const sockets = new Set();
+  const server = createServer((req, res) => {
+    if (req.url === "/redirect") {
+      // The redirect carries a validator; the response that serves the body
+      // does not. Recording `"abc"` would send it as `If-Range` next time, get
+      // a 200 back, and turn the resume into a full re-download.
+      res.writeHead(302, { Location: "/final", ETag: '"abc"' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "Content-Length": BODY.length, "Accept-Ranges": "bytes" });
+    res.end(BODY);
+  });
+  server.on("connection", (socket) => sockets.add(socket));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const dumpPath = join(dir, "headers.txt");
+    const out = join(dir, "out.bin");
+    const code = await new Promise((resolve) => {
+      const c = spawn("curl", ["-sS", "--location", "--dump-header", dumpPath, "-o", out, `${base}/redirect`]);
+      c.on("close", resolve);
+    });
+    assert.equal(code, 0);
+    assert.equal(readFileSync(out, "utf8"), BODY);
+
+    const dump = readFileSync(dumpPath, "utf8");
+    // The trap this guards: both blocks really are in one file.
+    assert.match(dump, /"abc"/, "the redirect's ETag must be present in the dump, or nothing is being tested");
+    assert.equal(dump.match(/^HTTP\//gim)?.length, 2, "curl must have written one status line per hop");
+
+    assert.deepEqual(parseValidators(dump), {}, "the final response carried no validator, so neither may we");
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The parser dropping a weak ETag only matters if the state file drops it too.
+// It did not: the merge that writes the sidecar fell back to whatever validator
+// was recorded before, so a weak ETag on this response resurrected a strong one
+// from an earlier, unrelated response — and the next resume would send it as
+// If-Range, get a 200, and lose the partial to exit 33.
+test("a weak ETag does not inherit a stale strong one through the state file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "weak-etag-"));
+  const sockets = new Set();
+  const server = createServer((req, res) => {
+    // Weak validator, and a body that stays open so the transfer can be caught
+    // mid-flight with its state still on disk.
+    res.writeHead(200, { "Content-Length": 1_000_000, ETag: 'W/"weak"', "Accept-Ranges": "bytes" });
+    const timer = setInterval(() => res.write("."), 100);
+    res.on("close", () => clearInterval(timer));
+  });
+  server.on("connection", (socket) => sockets.add(socket));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+  try {
+    const outputPath = join(dir, "out.bin");
+    const partPath = `${outputPath}.part`;
+    // A strong validator left behind by some earlier attempt at this path.
+    writePartialState(partPath, { v: 1, etag: '"stale-strong"' });
+
+    const ticket = await startDownload({
+      url: `http://127.0.0.1:${server.address().port}/file`,
+      outputPath,
+      statusDir: dir,
+    });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && readStatus(ticket.id, dir)?.state !== "downloading") {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await new Promise((r) => setTimeout(r, 400));
+
+    const { killDownload } = await import("../dist/detach.js");
+    await killDownload(ticket, { statusDir: dir });
+    await waitForTerminal(ticket.id, dir);
+
+    const state = readPartialState(partPath);
+    assert.ok(state, "a retained partial must record its provenance");
+    assert.equal(state.etag, undefined, "a weak ETag must not resurrect an older strong one");
+    assert.equal("etag" in state, false, "and the key must be absent, not present-and-empty");
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
