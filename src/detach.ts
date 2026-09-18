@@ -37,6 +37,7 @@ import {
   statusDir as defaultStatusDir,
   withStatusLock,
   writeStatus,
+  type DownloadState,
   type DownloadStatus,
 } from "./status";
 
@@ -273,6 +274,73 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
   });
   child.unref();
 
+  // One shape for both statuses this function may write: the spawn-failure
+  // below and the start-up seed further down. They differ in three fields and
+  // agreed on a dozen, and a field added to `DownloadStatus` must not have to
+  // be remembered twice — the half that gets forgotten is the failure path,
+  // which nothing routinely exercises.
+  const statusFor = (forPid: number, state: DownloadState, extra: Partial<DownloadStatus> = {}): DownloadStatus => {
+    const now = Date.now();
+    return {
+      schema: 1,
+      id,
+      pid: forPid,
+      startedAtMs: processStartTimeMs(forPid) ?? now,
+      state,
+      filename,
+      outputPath,
+      partPath,
+      bytesDownloaded: 0,
+      totalBytes: expectedBytes,
+      startedAt: now,
+      heartbeatAt: now,
+      meta,
+      ...extra,
+    };
+  };
+
+  // Attached BEFORE `child.pid` is inspected, which is the whole point.
+  //
+  // `spawn` reports ENOENT, EACCES and EMFILE ASYNCHRONOUSLY, on the child's
+  // `error` event, and an `error` event with no listener is thrown by
+  // EventEmitter. Measured on Node 22: spawning a nonexistent executable
+  // returns `pid === undefined` AND emits `error: ENOENT` a tick later — so
+  // registering after the `pid === undefined` branch below means that branch
+  // throws a clean DownloadError and the process then dies anyway on the
+  // unhandled event, in the Raycast host rather than in the caller's `catch`.
+  //
+  // Reported through the status file when there is a pid to report it against:
+  // the download the caller is already watching has to reach a terminal state,
+  // and this is the only channel a watcher listens on. With no pid there is no
+  // ticket, no watcher, and no valid status to write (readers require a
+  // positive pid), so the throw below is the entire contract.
+  let spawnFailed = false;
+  child.on("error", (error: Error) => {
+    spawnFailed = true;
+    try {
+      unlinkSync(payloadPath);
+    } catch {
+      // The runner never started, so nothing else will remove it.
+    }
+    const failedPid = child.pid;
+    if (failedPid === undefined) return;
+    try {
+      writeStatus(
+        statusFor(failedPid, "failed", {
+          finishedAt: Date.now(),
+          // `runner_failed`, deliberately not retryable: the helper could not be
+          // started at all, and the environment that prevented it is unchanged
+          // by trying again.
+          error: { code: "runner_failed", message: `Could not start the download process: ${error.message}` },
+        }),
+        statusDir,
+      );
+    } catch {
+      // A status write that fails leaves the watcher to time out on a missing
+      // status, which is the pre-existing behaviour and still terminal.
+    }
+  });
+
   const pid = child.pid;
   if (pid === undefined) {
     try {
@@ -295,28 +363,13 @@ export async function startDownload(options: StartDownloadOptions): Promise<Down
   // pid into its first status, so requiring the pid to match is a precise test
   // for "this attempt, not the last one".
   const seeded = await waitForStatus(id, statusDir, 3000, pid);
-  if (!seeded) {
+  // `spawnFailed` is checked because the seed would otherwise overwrite the
+  // terminal failure the error handler just wrote with a `starting` status that
+  // nothing will ever advance.
+  if (!seeded && !spawnFailed) {
     // The runner may still be starting; seed a status so the download is
     // visible and cancellable rather than invisible until its first write.
-    const now = Date.now();
-    writeStatus(
-      {
-        schema: 1,
-        id,
-        pid,
-        startedAtMs: processStartTimeMs(pid) ?? now,
-        state: "starting",
-        filename,
-        outputPath,
-        partPath,
-        bytesDownloaded: 0,
-        totalBytes: expectedBytes,
-        startedAt: now,
-        heartbeatAt: now,
-        meta,
-      },
-      statusDir,
-    );
+    writeStatus(statusFor(pid, "starting"), statusDir);
   }
 
   return { id, pid, statusPath: join(statusDir, `${id}.json`) };

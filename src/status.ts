@@ -64,6 +64,19 @@ export interface DownloadStatus {
   finishedAt?: number;
   error?: { code: string; message: string; httpStatus?: number };
   /**
+   * The partial file at `partPath` MUST NOT be resumed: delete or replace it
+   * before starting another attempt against this path. Set when the runner put
+   * something in that file that does not belong to the download — a redirect
+   * body — and could not then prove it safe; a resume would compute its offset
+   * from the contaminated length and splice the real file onto the end of it.
+   *
+   * Separate from `error.code` because it answers a separate question: `code`
+   * is why THIS attempt failed, this is whether the bytes on disk may be
+   * reused. Absence means no contamination was RECORDED, not that the partial
+   * was verified safe — a runner older than 0.1.3 cannot set this field.
+   */
+  partialUnsafe?: boolean;
+  /**
    * Which command instance currently owns this download, and until when.
    * Adoption is a compare-and-swap on this field.
    */
@@ -230,6 +243,15 @@ function readStatusFile(path: string): DownloadStatus | null {
       !Number.isFinite(parsed.startedAt)
     ) {
       return null;
+    }
+    // A malformed flag is COERCED to unsafe rather than rejecting the whole
+    // status. Both directions of the alternative are worse: read as falsy it
+    // reports a contaminated partial as safe, and rejecting the file makes a
+    // live download invisible to `watchStatus` and un-cancellable through
+    // `killDownload`, which both read through here. Only this field is treated
+    // this way — it is advisory, where every field above is structural.
+    if (parsed.partialUnsafe !== undefined && typeof parsed.partialUnsafe !== "boolean") {
+      parsed.partialUnsafe = true;
     }
     return parsed;
   } catch {

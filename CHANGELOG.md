@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.1.3
+
+**`partialUnsafe` on `DownloadStatus`: a machine-checkable "do not resume this file".**
+
+0.1.2 added the case but not a way to detect it. When the runner writes a redirect body
+into the partial and can then neither truncate it back nor delete it, the bytes on disk
+must not be resumed — `curl -C -` would append the real download after the HTML. That was
+only ever expressed as a sentence glued onto `error.message` and a `bytesDownloaded: 0`,
+neither of which a consumer can branch on: zero also means an empty response and a failed
+setup.
+
+The flag is deliberately NOT a new error code and does not change the existing one. They
+answer different questions: `error.code` is why THIS attempt failed (`http_client`, with
+`httpStatus: 302`), `partialUnsafe` is whether the bytes on disk may be reused. A 304
+against a resumed transfer proves they are independent — it fails while leaving a
+perfectly valid partial behind.
+
+Additive and optional, so no `schema` bump: the reader already accepts unknown fields. It
+IS validated as a boolean when present, because a malformed value would otherwise read as
+falsy and report a contaminated partial as safe.
+
+**Absence is not proof of safety.** A runner from 0.1.2 or earlier cannot set this field,
+so a status it wrote is silent on the question. That is unavoidable for any new signal.
+
+**A rejected spawn no longer crashes the host command.** `spawn` reports ENOENT, EACCES and
+EMFILE on the child's `error` event, asynchronously — the existing `pid === undefined`
+check only ever caught the synchronous case. An `error` event with no listener is thrown
+by EventEmitter, and it fires after `startDownload` has usually already resolved, so it
+landed in the Raycast host rather than in the caller's `catch`. Measured on Node 22:
+spawning a nonexistent executable returns `pid === undefined` AND emits `error: ENOENT` a
+tick later, so both halves fire.
+
+The listener is therefore attached before `child.pid` is inspected. With a pid, the
+failure is reported the way every other runner failure is — a terminal `failed` status
+with code `runner_failed`, which the watcher the caller already attached will see. Without
+one there is no ticket and no valid status to write, so the thrown `DownloadError` stays
+the whole contract.
+
+**A redirect body that cannot be deleted is now flagged on a first attempt too.** 0.1.3's
+first cut only set `partialUnsafe` when the transfer was resuming. On an initial download
+the contaminated partial was discarded best-effort and the outcome ignored, so a denied
+delete left redirect HTML on disk with nothing recording it — and `resume` defaults to
+true, so the next attempt appended the real download to it. Same corruption the flag
+exists to prevent, one path over.
+
+**A malformed `partialUnsafe` is coerced to `true`, not used to reject the status.**
+Reading it as falsy would report a contaminated partial as safe; rejecting the whole file
+would make a live download invisible to `watchStatus` and un-cancellable through
+`killDownload`. It is the only field treated this way — it is advisory, where every other
+validated field is structural.
+
+**README gains a quick-start recipe** for driving a toast and preference-gated console
+logs from one `watchStatus` handler set, including the two things consumers get wrong —
+logging the URL instead of the typed error code, and omitting `onAbandoned`, which leaves
+a toast animating forever when the runner dies without recording an outcome.
+
 ## 0.1.2
 
 **A rollback that cannot be verified now discards the partial instead of trusting it.**

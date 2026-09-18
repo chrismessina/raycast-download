@@ -321,10 +321,16 @@ function main(): void {
       // on disk, and the next attempt would compute `existingBytes` from that
       // longer file and `curl -C -` the real recording onto the end of it. That
       // is precisely the corruption this branch exists to prevent, so it has to
-      // reach the status: a consumer cannot see a cleanup failure any other way.
+      // reach the status as `partialUnsafe`: a consumer cannot see a cleanup
+      // failure any other way, and `bytesDownloaded: 0` cannot carry it (an
+      // empty response and a failed setup both report zero too).
       let unsafePartial = false;
       if (redirectStub && existingBytes > 0) unsafePartial = !rollbackPartial(payload.partPath, existingBytes);
-      else if (redirectStub) discardPart(payload.partPath);
+      // The zero-prefix case is NOT exempt. Nothing needs preserving, so the
+      // whole file goes — but if the delete is denied the redirect body is
+      // still on disk, and `resume` defaults to true, so the next attempt
+      // appends the real download to it. Same corruption, same flag.
+      else if (redirectStub) unsafePartial = !discardPart(payload.partPath);
       else discardEmptyPart(payload.partPath);
 
       const cancelled = error.code === "cancelled";
@@ -338,7 +344,7 @@ function main(): void {
         // `{ ...status, ...next }`, so an explicit undefined would overwrite a
         // real byte count — and readStatusFile rejects a status whose
         // bytesDownloaded is not finite, making the whole file unreadable.
-        ...(unsafePartial ? { bytesDownloaded: 0 } : {}),
+        ...(unsafePartial ? { bytesDownloaded: 0, partialUnsafe: true } : {}),
         error: { code: error.code, message, httpStatus: error.httpStatus },
       });
       // Cancellation is deliberately silent: the user performed it, so telling
@@ -503,12 +509,21 @@ function notify(payload: RunnerPayload, subtitle: string, message: string): void
  * safe to discard.
  */
 /** Roll a `.part` file back to the byte count it held before this attempt. */
-/** Remove a `.part` file outright, whatever it holds. */
-function discardPart(partPath: string): void {
+/**
+ * Remove a `.part` file outright, whatever it holds.
+ *
+ * Returns false when the file is still there afterwards. NOT best-effort-and-
+ * forget: this runs on a partial holding a redirect body, and a caller that
+ * ignores the outcome leaves contaminated bytes on disk with nothing recording
+ * that they are contaminated — the next attempt resumes onto them.
+ */
+function discardPart(partPath: string): boolean {
   try {
     unlinkSync(partPath);
+    return true;
   } catch {
-    // Best effort.
+    // Gone already is success; anything else means it is still there.
+    return !existsSync(partPath);
   }
 }
 

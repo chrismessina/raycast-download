@@ -29,6 +29,75 @@ watchStatus(ticket.id, {
 });
 ```
 
+## Quick start: toasts and console logs from one watcher
+
+The status file is the only channel the detached runner has, and it carries everything both surfaces need. Drive the toast and the log line from the same `watchStatus` handlers rather than building a second reporting path:
+
+```ts
+import { showToast, Toast } from "@raycast/api";
+import { logger } from "@chrismessina/raycast-logger"; // optional, your install
+import { startDownload, watchStatus, formatProgressLine, isDownloadError } from "@chrismessina/raycast-downloader";
+
+// Fire the indicator BEFORE the async work, so the UI is never silent.
+const toast = await showToast({ style: Toast.Style.Animated, title: "Starting download…" });
+
+try {
+  const ticket = await startDownload({ url: signedUrl, outputPath, expectedBytes });
+
+  watchStatus(ticket.id, {
+    onChange: (s) => {
+      toast.title = s.state === "downloading" ? "Downloading" : "Preparing…";
+      toast.message = formatProgressLine(s);
+      logger.debug("download", { id: s.id, state: s.state, bytes: s.bytesDownloaded });
+    },
+    onSettled: (s) => {
+      if (s.state === "completed") {
+        toast.style = Toast.Style.Success;
+        toast.title = "Downloaded";
+        toast.message = s.filename;
+        logger.debug("download complete", { id: s.id, bytes: s.bytesDownloaded });
+        return;
+      }
+      toast.style = Toast.Style.Failure;
+      toast.title = s.state === "cancelled" ? "Cancelled" : "Download failed";
+      toast.message = s.error?.message;
+      logger.debug("download failed", { id: s.id, code: s.error?.code, httpStatus: s.error?.httpStatus });
+    },
+    // The runner died without recording an outcome — a real state, not an edge
+    // case, and a toast left spinning is worse than one that says so.
+    onAbandoned: (s) => {
+      toast.style = Toast.Style.Failure;
+      toast.title = "Download interrupted";
+      logger.debug("download abandoned", { id: s.id, bytes: s.bytesDownloaded });
+    },
+  });
+} catch (error) {
+  // Everything that fails before there is anything to watch lands here: no
+  // runner on disk, no curl, a spawn the OS refused outright. There is no
+  // ticket and no status file in those cases, so this is the only place they
+  // become visible. (A spawn that fails AFTER the OS assigned a pid is
+  // reported the other way — as a terminal `runner_failed` status your watcher
+  // receives — because by then you already have a ticket.)
+  toast.style = Toast.Style.Failure;
+  toast.title = "Could not start the download";
+  if (isDownloadError(error)) {
+    toast.message = error.message;
+    logger.debug("launch failed", { code: error.code, retryable: error.retryable });
+  }
+  throw error;
+}
+```
+
+Three things worth copying exactly:
+
+**Log the typed `code`, never the URL or the raw cause.** A signed URL is a bearer credential — it travels in a 0600 file rather than argv for that reason, and a log line is the easiest way to undo that. `error.code`, `error.httpStatus` and `retryable` say everything actionable without carrying the secret.
+
+**Use `logger.debug` or `logger.log`, not `logger.error`.** This package takes no logger dependency — `@chrismessina/raycast-logger` is one you install yourself, and any logger works. If you use that one: as of v1.5.0 only `debug` and `log` are gated on the `verboseLogging` preference, while `error` and `warn` emit regardless, so an expected failure would print in every user's console. Check your own logger's gating before copying this.
+
+**`onAbandoned` is not optional.** It fires when the runner died without recording an outcome, and a consumer that only handles `onSettled` leaves the toast animating forever.
+
+The package itself logs nothing and takes no logger dependency. That is deliberate: the runner runs outside the Raycast host, where `@raycast/api` does not resolve and its stdio is discarded, so anything it printed would go nowhere. What it knows, it writes to the status file — which is what the code above reads.
+
 ## Scope of the guarantee
 
 **Survives:** Raycast dismissal, the command being unloaded, the parent process exiting.
@@ -120,6 +189,8 @@ curl      buildCurlConfig · parseCurlMeter · parseWriteOut · classifyCurlFail
 Import from the root or from a subpath (`@chrismessina/raycast-downloader/paths`).
 
 ## Notes for consumers
+
+**Check `partialUnsafe` before you resume.** A failed download normally leaves its `.part` file in place precisely so a retry can resume from it. `partialUnsafe: true` on the status is the exception: the runner put something in that file that does not belong to the download and could not take it back out, so resuming would splice the real file onto it. Delete or replace the partial before the next attempt. The flag is absent on every ordinary status — including failures whose partial is perfectly resumable — and absence means "nothing was recorded", not "verified safe": a runner older than 0.1.3 cannot set it. Do not read `bytesDownloaded: 0` as the same signal; an empty response and a failed setup report zero too.
 
 **A 3xx is never a successful download — including with redirects on.** Success is strictly 2xx. With redirects on (the default) curl follows the hops and reports the final 2xx, so the usual redirect is invisible to you; but `--location` only follows a response carrying a usable `Location`, so a **304** (you sent a conditional header) or a **300** ends the transfer as itself. Those now fail with `http_client` rather than publishing an empty or stale file. With `followRedirects: false`, curl writes the redirect *body* to the `.part` file and exits 0 — that stub is discarded and the download fails with "The server redirected (HTTP 302) but redirects are disabled." Expose the preference if your users need it; don't expect a 302 to still produce a file.
 

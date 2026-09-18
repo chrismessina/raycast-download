@@ -21,6 +21,7 @@ import { spawn } from "node:child_process";
 
 import { startDownload, runnerPath } from "../dist/detach.js";
 import { readStatus, isTerminal } from "../dist/status.js";
+import { DownloadError } from "../dist/errors.js";
 import { buildCurlConfig } from "../dist/curl.js";
 
 const FINAL_BODY = "REAL-PAYLOAD-BYTES";
@@ -261,6 +262,86 @@ test("a legacy payload with no followRedirects field still follows redirects", a
       assert.equal(readFileSync(outputPath, "utf8"), FINAL_BODY);
     });
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// NOT tested end to end, deliberately: the `partialUnsafe` state needs curl to
+// write a 3xx body into the partial and the filesystem to deny cleanup
+// AFTERWARDS. Making the file untouchable up front does not produce it — curl
+// opens the output for writing before the request, so it fails with exit 23 and
+// http_code 0, which is not a 3xx and never reaches the rollback at all
+// (measured). Reproducing it means racing a permission change mid-transfer.
+// The two halves are covered separately instead: `rollbackPartial` returning
+// false when every cleanup is denied (test/rollback.test.mjs), and the flag
+// surviving the status write/read round trip (below).
+
+test("readStatus never lets a malformed partialUnsafe read as safe", () => {
+  const dir = tempDir();
+  try {
+    const base = {
+      schema: 1,
+      id: "shape",
+      pid: 123,
+      startedAtMs: 1,
+      state: "failed",
+      filename: "f",
+      outputPath: "/tmp/f",
+      partPath: "/tmp/f.part",
+      bytesDownloaded: 0,
+      heartbeatAt: 1,
+      startedAt: 1,
+    };
+    const path = join(dir, "shape.json");
+
+    // Coerced, not rejected: reading it as falsy would report a contaminated
+    // partial as safe, and rejecting the whole status would make a live
+    // download invisible and un-cancellable.
+    writeFileSync(path, JSON.stringify({ ...base, partialUnsafe: "yes" }));
+    assert.equal(readStatus("shape", dir).partialUnsafe, true, "a non-boolean must never read as a safe partial");
+
+    writeFileSync(path, JSON.stringify({ ...base, partialUnsafe: true }));
+    assert.equal(readStatus("shape", dir).partialUnsafe, true);
+
+    writeFileSync(path, JSON.stringify(base));
+    assert.equal(readStatus("shape", dir).partialUnsafe, undefined, "absence stays absent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A spawn that fails asynchronously must not take the host down. `spawn`
+// reports ENOENT on the child's `error` event, and an `error` event with no
+// listener is thrown by EventEmitter — in the Raycast host, after
+// `startDownload` has usually already resolved. Forced by pointing
+// `process.execPath` at nothing, which is writable in this runtime.
+test("a rejected spawn surfaces as a typed error, not an unhandled error event", async () => {
+  const dir = tempDir();
+  const realExecPath = process.execPath;
+  const uncaught = [];
+  const onUncaught = (error) => uncaught.push(error);
+  process.on("uncaughtException", onUncaught);
+  try {
+    const stub = join(dir, "stub-runner.mjs");
+    writeFileSync(stub, "");
+    process.execPath = join(dir, "no-such-node");
+
+    await assert.rejects(
+      startDownload({
+        url: "https://example.com/file.bin",
+        outputPath: join(dir, "out.bin"),
+        statusDir: dir,
+        runnerPath: stub,
+      }),
+      (error) => error instanceof DownloadError,
+    );
+
+    // The event fires a tick after the throw; give it room to land.
+    await new Promise((r) => setTimeout(r, 250));
+    assert.deepEqual(uncaught, [], "the spawn error must be handled, not thrown at the host");
+  } finally {
+    process.execPath = realExecPath;
+    process.off("uncaughtException", onUncaught);
     rmSync(dir, { recursive: true, force: true });
   }
 });
