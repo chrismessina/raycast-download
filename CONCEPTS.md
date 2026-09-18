@@ -50,12 +50,46 @@ until the result has been verified and can be published under the real name.
 
 It carries three jobs at once, which is why it is worth naming. It holds the bytes a later attempt
 resumes from; it doubles as the [reservation](#reservation) on the final name; and its presence
-after a failure is the signal that resuming is worthwhile at all. Those jobs conflict: the bytes
+after a failure is the signal that resuming is worthwhile at all. Whether those bytes may actually
+be appended to is a separate question, answered by their [provenance](#provenance) rather than by
+their number. Those jobs conflict: the bytes
 are only resumable if every byte in the file genuinely belongs to the wanted file, so anything a
 failed attempt wrote — an error page, a redirect body — must be rolled back before the file is left
 behind, and a rollback that cannot be verified means the file must be discarded instead.
 Publishing is a rename of this file, which is what makes the final name appear only once the
 content behind it is whole.
+
+## Provenance
+
+What is recorded alongside a [partial file](#partial-file) about where its bytes came from: which
+resource they were fetched from, and the server's own description of that resource at the time.
+
+It exists because a byte count is not evidence. Resuming asks a server to continue from an offset,
+and that request asserts the bytes already held are a correct prefix of what is being fetched — an
+assertion the server takes on trust and no later check can catch, because the result has exactly
+the length it should. Only the process that wrote the prefix knows what the prefix is, so it has to
+write that down for whoever comes next.
+
+Provenance is recorded as soon as the response arrives rather than when the transfer ends: the
+transfers that most need to be resumable are the ones that never end, so recording at the end would
+produce partials that can never be resumed precisely in the cases resuming exists for.
+
+## Path claim
+
+A statement that one attempt is writing to a particular destination right now, held for as long as
+that attempt runs.
+
+Distinct from a [reservation](#reservation), which says a name is spoken for, and from a
+[lease](#lease), which says which window is presenting a transfer. This says which process owns the
+bytes. It is required because two transfers with different identifiers can target one destination,
+and the second one's resume appends to the first one's bytes — a conflict neither of the other two
+can see, because both are scoped to something other than the destination.
+
+Taking a claim must be atomic in the filesystem's own terms and must publish its contents in the
+same step, since a claim observed half-written is read as no claim at all. Releasing one names its
+holder: a release that means "remove whatever is here" will remove a later attempt's claim when an
+earlier attempt's cleanup arrives late. A claim whose owner is provably gone is stolen, or a
+crashed attempt would hold a destination forever.
 
 ## Reservation
 
@@ -93,6 +127,11 @@ overwrite an earlier one are all the same question.
 
 ## Flagged ambiguities
 
+- **Reservation vs. path claim vs. lease.** Three claims on three different things, and conflating
+  them silently removes a guarantee. A reservation holds a NAME so two callers do not choose it. A
+  path claim holds a DESTINATION so two attempts do not write to it. A lease holds a PRESENTATION so
+  two windows do not both narrate one transfer. An attempt can hold all three at once; losing any
+  one of them breaks something the others still appear to cover.
 - **Abandoned vs. finished.** An attempt observed as "no longer running" has two meanings that must
   not be conflated: it died, or it completed while nobody was watching. Treating the second as the
   first discards a successful result.
